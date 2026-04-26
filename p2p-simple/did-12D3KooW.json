@@ -1,0 +1,12 @@
+{
+  "@context": "https://www.w3.org/ns/did/v1",
+  "id": "did:peer:12D3KooWFuJD2j9b7UT2sDKkx2PTP9ZQdADbgU6aYwAyhxpX3Sxa",
+  "verificationMethod": [
+    {
+      "id": "did:peer:12D3KooWFuJD2j9b7UT2sDKkx2PTP9ZQdADbgU6aYwAyhxpX3Sxa#key-1",
+      "type": "EcdsaSecp256k1VerificationKey2019",
+      "controller": "did:peer:12D3KooWFuJD2j9b7UT2sDKkx2PTP9ZQdADbgU6aYwAyhxpX3Sxa",
+      "publicKeyHex": "3059301306072a8648ce3d020106082a8648ce3d0301070342000495db0ebcec54b6cb7739f509132bbcc2d70f7659eb2d42037111b462920d861e3cb2c368a73b974b15f0969c312e96a3ca23cf9ed62c29fc037ac765cf2ce6a2"
+    }
+  ]
+}
