@@ -6,21 +6,22 @@ import { bootstrap } from '@libp2p/bootstrap'
 import { mdns } from '@libp2p/mdns'
 import { fromString, toString } from 'uint8arrays'
 import { generateKeyPair, createDID, signMessage, verifyMessage } from './crypto.js'
+import { BlockchainClient, RevocationReason } from './blockchain.js'
 import * as readline from 'readline'
 
-// ── PASTE RELAY ADDRESS HERE ──────────────────────────────────────
-const BOOTSTRAP_ADDR = '/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWDrVXBueH62aGpGxdeYU8AJFUT6n38xfmNMRXydtk682S'
-// ─────────────────────────────────────────────────────────────────
+const BOOTSTRAP_ADDR = process.env.RELAY_ADDR || '/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWDrVXBueH62aGpGxdeYU8AJFUT6n38xfmNMRXydtk682S'
+const RELAY_ID = BOOTSTRAP_ADDR.includes('/p2p/') ? BOOTSTRAP_ADDR.split('/p2p/')[1] : ''
 
-const RELAY_ID = BOOTSTRAP_ADDR.split('/p2p/')[1]
-
-// Step 2: Generate ECDSA keypair + DID for this peer
 const { privateKey, publicKey } = generateKeyPair()
+const trustScores = new Map()
+const keyRegistry = new Map()
+const peers       = new Set()
 
-// Step 4: Trust score database
-const trustScores = new Map()  // peerId → score
-const keyRegistry  = new Map() // peerId → publicKeyHex
-const peers        = new Set() // active peer IDs
+const walletIndexArg = process.argv[2] ? parseInt(process.argv[2]) : (process.env.WALLET_INDEX ? parseInt(process.env.WALLET_INDEX) : 2)
+const blockchain = new BlockchainClient({
+  walletIndex: walletIndexArg,
+  rpcUrl: process.env.RPC_URL || 'http://127.0.0.1:8545'
+})
 
 const node = await createLibp2p({
   addresses: { listen: ['/ip4/0.0.0.0/tcp/0'] },
@@ -36,66 +37,48 @@ const node = await createLibp2p({
 const MY_ID  = node.peerId.toString()
 const MY_DID = createDID(MY_ID, publicKey)
 
-// ── Protocol 1: DID announcement ────────────────────────────────
-// Step 3: When connected, share our DID + public key
+const bcConnected = await blockchain.init()
+if (bcConnected) {
+  console.log(`⛓️  [BadPeer] Blockchain connected for adversarial testing.`)
+}
+
+// Attack modes:
+// 1. 'forge'    - Send fake/corrupted signatures
+// 2. 'revoked'  - Register, revoke own key, then try sending messages
+// 3. 'valid'    - Normal compliant behavior
+let attackMode = 'forge'
+
 node.handle('/did/1.0.0', async ({ stream, connection }) => {
   const sender = connection.remotePeer.toString()
   for await (const chunk of stream.source) {
     try {
-      const { peerId, did, publicKey: theirKey } = JSON.parse(toString(chunk.subarray()))
+      const { peerId, publicKey: theirKey } = JSON.parse(toString(chunk.subarray()))
       keyRegistry.set(peerId, theirKey)
-      if (!trustScores.has(peerId)) {
-        trustScores.set(peerId, 50)
-        console.log(`\n🆔 DID received from: ${peerId.slice(0,16)}...`)
-        console.log(`   DID  : ${did.id}`)
-        console.log(`   Trust initialized: 50/100`)
-      }
     } catch {}
   }
 })
 
-// ── Protocol 2: Signed chat messages ────────────────────────────
-// Step 6: Verify signature on received messages
 node.handle('/chat/1.0.0', async ({ stream, connection }) => {
-  const sender = connection.remotePeer.toString()
   for await (const chunk of stream.source) {
     try {
-      const { message, signature } = JSON.parse(toString(chunk.subarray()))
-
-      const senderKey = keyRegistry.get(sender)
-      if (!senderKey) {
-        console.log(`\n⚠️  Message from ${sender.slice(0,16)}... — no DID yet`)
-        continue
-      }
-
-      // Step 6: Verify ECDSA signature using public key from gossip
-      const valid   = verifyMessage(message, signature, senderKey)
-      const current = trustScores.get(sender) ?? 50
-
-      if (valid) {
-        const next = Math.min(100, current + 5)
-        trustScores.set(sender, next)
-        console.log(`\n📩 [✅ VERIFIED] ${sender.slice(0,16)}...: ${message}`)
-        console.log(`   Trust: ${current} → ${next}`)
-      } else {
-        const next = Math.max(0, current - 20)
-        trustScores.set(sender, next)
-        console.log(`\n📩 [❌ INVALID ] ${sender.slice(0,16)}...: bad signature!`)
-        console.log(`   Trust: ${current} → ${next}`)
-      }
+      const { message } = JSON.parse(toString(chunk.subarray()))
+      console.log(`\n📩 Received: ${message}`)
     } catch {}
   }
 })
 
 await node.start()
 
-console.log('\n✅ Peer started')
-console.log('Peer ID :', MY_ID)
-console.log('DID     :', MY_DID.id)
-console.log('PubKey  :', publicKey.slice(0, 20) + '...')
-console.log('\nCommands: type a message | "trust" | "peers" | Ctrl+C to quit\n')
+console.log('\n⚠️  [Adversary Node Started]')
+console.log('Peer ID    :', MY_ID)
+console.log('Attack Mode:', attackMode.toUpperCase())
+console.log('\nCommands:')
+console.log('  <message>       - Send message using current attack mode')
+console.log('  mode forge      - Set attack mode to send corrupted signatures')
+console.log('  mode revoked    - Register on-chain, revoke key, and send messages with revoked key')
+console.log('  mode valid      - Send valid signatures')
+console.log('  peers           - Show connected peers\n')
 
-// Step 3: Announce our DID to a newly connected peer
 async function announceDID(peerId) {
   try {
     const stream  = await node.dialProtocol(peerId, '/did/1.0.0')
@@ -108,8 +91,7 @@ node.addEventListener('peer:connect', async (e) => {
   const id = e.detail.toString()
   if (id === RELAY_ID) { console.log('🔗 Connected to relay'); return }
   peers.add(id)
-  console.log(`\n🔗 Peer joined: ${id.slice(0,16)}... (${peers.size} peer(s))`)
-  // Step 3: share DID immediately on connect
+  console.log(`\n🔗 Peer joined: ${id.slice(0,16)}...`)
   setTimeout(() => announceDID(e.detail), 500)
 })
 
@@ -117,7 +99,6 @@ node.addEventListener('peer:disconnect', (e) => {
   const id = e.detail.toString()
   if (id === RELAY_ID) return
   peers.delete(id)
-  console.log(`\n🔌 Peer left: ${id.slice(0,16)}... (${peers.size} peer(s) remaining)`)
 })
 
 node.addEventListener('peer:discovery', async (evt) => {
@@ -127,7 +108,6 @@ node.addEventListener('peer:discovery', async (evt) => {
   try { await node.dial(peerId) } catch {}
 })
 
-// Step 5: Sign and send message to all peers
 async function sendToAll(message) {
   const connections = node.getConnections()
   const peerConns   = connections.filter(c => c.remotePeer.toString() !== RELAY_ID)
@@ -137,10 +117,22 @@ async function sendToAll(message) {
     return
   }
 
-  const signature = 'blah' // garbage hex
-  const payload   = JSON.stringify({ message, signature })
-  const seen      = new Set()
-  let sent        = 0
+  let signature = ''
+  if (attackMode === 'forge') {
+    signature = 'deadbeef_invalid_signature_hex_12345'
+    console.log('😈 Attacking: Sending message with forged signature...')
+  } else {
+    signature = signMessage(message, privateKey)
+    if (attackMode === 'revoked') {
+      console.log('😈 Attacking: Sending message with cryptographically REVOKED key...')
+    } else {
+      console.log('😇 Sending compliant signed message...')
+    }
+  }
+
+  const payload = JSON.stringify({ message, signature })
+  const seen    = new Set()
+  let sent      = 0
 
   for (const conn of peerConns) {
     const id = conn.remotePeer.toString()
@@ -152,31 +144,31 @@ async function sendToAll(message) {
       sent++
     } catch {}
   }
-  console.log(`📤 Sent to ${sent} peer(s)`)
-}
-
-function printTrustScores() {
-  console.log('\n📊 Trust Scores:')
-  if (trustScores.size === 0) { console.log('   (none yet)'); return }
-  trustScores.forEach((score, peerId) => {
-    const bar   = '█'.repeat(Math.floor(score / 10))
-    const empty = '░'.repeat(10 - Math.floor(score / 10))
-    console.log(`   ${peerId.slice(0,16)}... [${bar}${empty}] ${score}/100`)
-  })
-  console.log()
-}
-
-function printPeers() {
-  console.log(`\n👥 Connected peers: ${peers.size}`)
-  peers.forEach(id => console.log(`   ${id.slice(0,16)}...`))
-  console.log()
+  console.log(`📤 Dispatched attack payload to ${sent} peer(s)`)
 }
 
 const rl = readline.createInterface({ input: process.stdin })
 rl.on('line', async (line) => {
   const input = line.trim()
   if (!input) return
-  if (input === 'trust') printTrustScores()
-  else if (input === 'peers') printPeers()
-  else await sendToAll(input)
+
+  if (input.startsWith('mode')) {
+    const mode = input.split(' ')[1]
+    if (['forge', 'revoked', 'valid'].includes(mode)) {
+      attackMode = mode
+      if (attackMode === 'revoked' && blockchain.isOnline) {
+        console.log('⛓️  Registering then immediately revoking on-chain key...')
+        await blockchain.registerKey(MY_ID, publicKey, MY_DID.id)
+        await blockchain.revokeKey(MY_ID, RevocationReason.KEY_COMPROMISE)
+        console.log('🛑 Key revoked on-chain! Ready to test revoked-key attacks.')
+      }
+      console.log(`✅ Attack mode switched to: ${attackMode.toUpperCase()}`)
+    } else {
+      console.log('Unknown mode. Options: forge, revoked, valid')
+    }
+  } else if (input === 'peers') {
+    console.log(`Connected peers: ${peers.size}`)
+  } else {
+    await sendToAll(input)
+  }
 })
