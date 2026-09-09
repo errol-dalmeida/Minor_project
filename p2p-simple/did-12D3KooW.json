@@ -1,12 +1,12 @@
 {
   "@context": "https://www.w3.org/ns/did/v1",
-  "id": "did:peer:12D3KooWN6L8h28QtEjRhwXek27Ger4VoVGLe7omYaHZpRUnYWFP",
+  "id": "did:peer:12D3KooWMkvBE0n0s8AxpsLFfa7aeX9E6HqO695LenWqVaUkbRs7",
   "verificationMethod": [
     {
-      "id": "did:peer:12D3KooWN6L8h28QtEjRhwXek27Ger4VoVGLe7omYaHZpRUnYWFP#key-1",
+      "id": "did:peer:12D3KooWMkvBE0n0s8AxpsLFfa7aeX9E6HqO695LenWqVaUkbRs7#key-1",
       "type": "EcdsaSecp256r1VerificationKey2020",
-      "controller": "did:peer:12D3KooWN6L8h28QtEjRhwXek27Ger4VoVGLe7omYaHZpRUnYWFP",
-      "publicKeyHex": "3059301306072a8648ce3d020106082a8648ce3d03010703420004bb72201f63423586ce16aced2ae63229115d49ff0ac8db0bae9eccc145d374fe8fb53aa46ff165e2c64b6c0e1aef0b5d7b50756f34a7c6d10cd058a9a27205f0"
+      "controller": "did:peer:12D3KooWMkvBE0n0s8AxpsLFfa7aeX9E6HqO695LenWqVaUkbRs7",
+      "publicKeyHex": "3059301306072a8648ce3d020106082a8648ce3d03010703420004662f26916c804bbf182210346ea2121954e67ae95465de755e0c9b7f10b51a9f3bd7515d8f6c2dabd7a75efa8a7d6dcfea5475d3183cb65f35ca9a2e57aa71fd"
     }
   ]
 }

@@ -6,7 +6,7 @@ import { bootstrap } from '@libp2p/bootstrap'
 import { mdns } from '@libp2p/mdns'
 import { fromString, toString } from 'uint8arrays'
 import { generateKeyPair, createDID, signMessage, verifyMessage } from './crypto.js'
-import { BlockchainClient, RevocationReason } from './blockchain.js'
+import { NativeBlockchain, RevocationReason } from './blockchain.js'
 import * as readline from 'readline'
 
 const BOOTSTRAP_ADDR = process.env.RELAY_ADDR || '/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWDrVXBueH62aGpGxdeYU8AJFUT6n38xfmNMRXydtk682S'
@@ -17,11 +17,7 @@ const trustScores = new Map()
 const keyRegistry = new Map()
 const peers       = new Set()
 
-const walletIndexArg = process.argv[2] ? parseInt(process.argv[2]) : (process.env.WALLET_INDEX ? parseInt(process.env.WALLET_INDEX) : 2)
-const blockchain = new BlockchainClient({
-  walletIndex: walletIndexArg,
-  rpcUrl: process.env.RPC_URL || 'http://127.0.0.1:8545'
-})
+const blockchain = new NativeBlockchain()
 
 const node = await createLibp2p({
   addresses: { listen: ['/ip4/0.0.0.0/tcp/0'] },
@@ -37,10 +33,8 @@ const node = await createLibp2p({
 const MY_ID  = node.peerId.toString()
 const MY_DID = createDID(MY_ID, publicKey)
 
-const bcConnected = await blockchain.init()
-if (bcConnected) {
-  console.log(`⛓️  [BadPeer] Blockchain connected for adversarial testing.`)
-}
+// Register on native blockchain initially
+await blockchain.registerKey(MY_ID, publicKey, MY_DID.id, privateKey)
 
 // Attack modes:
 // 1. 'forge'    - Send fake/corrupted signatures
@@ -48,8 +42,20 @@ if (bcConnected) {
 // 3. 'valid'    - Normal compliant behavior
 let attackMode = 'forge'
 
+// Sync protocol
+node.handle('/chain/sync/1.0.0', async ({ stream }) => {
+  for await (const chunk of stream.source) {
+    try {
+      const msg = JSON.parse(toString(chunk.subarray()))
+      if (msg.type === 'GET_CHAIN') {
+        const response = JSON.stringify({ type: 'CHAIN_RESPONSE', chain: blockchain.chain })
+        await stream.sink([fromString(response)])
+      }
+    } catch {}
+  }
+})
+
 node.handle('/did/1.0.0', async ({ stream, connection }) => {
-  const sender = connection.remotePeer.toString()
   for await (const chunk of stream.source) {
     try {
       const { peerId, publicKey: theirKey } = JSON.parse(toString(chunk.subarray()))
@@ -58,7 +64,7 @@ node.handle('/did/1.0.0', async ({ stream, connection }) => {
   }
 })
 
-node.handle('/chat/1.0.0', async ({ stream, connection }) => {
+node.handle('/chat/1.0.0', async ({ stream }) => {
   for await (const chunk of stream.source) {
     try {
       const { message } = JSON.parse(toString(chunk.subarray()))
@@ -69,14 +75,16 @@ node.handle('/chat/1.0.0', async ({ stream, connection }) => {
 
 await node.start()
 
-console.log('\n⚠️  [Adversary Node Started]')
+console.log('\n================================================================')
+console.log(' ⚠️  ADVERSARY NODE STARTED (Attack Simulator)')
+console.log('================================================================')
 console.log('Peer ID    :', MY_ID)
 console.log('Attack Mode:', attackMode.toUpperCase())
 console.log('\nCommands:')
 console.log('  <message>       - Send message using current attack mode')
 console.log('  mode forge      - Set attack mode to send corrupted signatures')
-console.log('  mode revoked    - Register on-chain, revoke key, and send messages with revoked key')
-console.log('  mode valid      - Send valid signatures')
+console.log('  mode revoked    - Revoke key on blockchain and attempt sending messages')
+console.log('  mode valid      - Send valid signed messages')
 console.log('  peers           - Show connected peers\n')
 
 async function announceDID(peerId) {
@@ -87,12 +95,21 @@ async function announceDID(peerId) {
   } catch {}
 }
 
+async function syncBlockchainWithPeer(peerId) {
+  try {
+    const stream = await node.dialProtocol(peerId, '/chain/sync/1.0.0')
+    const payload = JSON.stringify({ type: 'GET_CHAIN' })
+    await stream.sink([fromString(payload)])
+  } catch {}
+}
+
 node.addEventListener('peer:connect', async (e) => {
   const id = e.detail.toString()
   if (id === RELAY_ID) { console.log('🔗 Connected to relay'); return }
   peers.add(id)
-  console.log(`\n🔗 Peer joined: ${id.slice(0,16)}...`)
-  setTimeout(() => announceDID(e.detail), 500)
+  console.log(`\n🔗 Peer joined: ${id.slice(0, 16)}...`)
+  setTimeout(() => announceDID(e.detail), 400)
+  setTimeout(() => syncBlockchainWithPeer(e.detail), 700)
 })
 
 node.addEventListener('peer:disconnect', (e) => {
@@ -109,17 +126,16 @@ node.addEventListener('peer:discovery', async (evt) => {
 })
 
 async function sendToAll(message) {
-  const connections = node.getConnections()
-  const peerConns   = connections.filter(c => c.remotePeer.toString() !== RELAY_ID)
+  const connections = node.getConnections().filter(c => c.remotePeer.toString() !== RELAY_ID)
 
-  if (peerConns.length === 0) {
+  if (connections.length === 0) {
     console.log('⚠️  No peers connected yet')
     return
   }
 
   let signature = ''
   if (attackMode === 'forge') {
-    signature = 'deadbeef_invalid_signature_hex_12345'
+    signature = '30440220deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb0220deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb'
     console.log('😈 Attacking: Sending message with forged signature...')
   } else {
     signature = signMessage(message, privateKey)
@@ -131,13 +147,9 @@ async function sendToAll(message) {
   }
 
   const payload = JSON.stringify({ message, signature })
-  const seen    = new Set()
-  let sent      = 0
+  let sent = 0
 
-  for (const conn of peerConns) {
-    const id = conn.remotePeer.toString()
-    if (seen.has(id)) continue
-    seen.add(id)
+  for (const conn of connections) {
     try {
       const stream = await node.dialProtocol(conn.remotePeer, '/chat/1.0.0')
       await stream.sink([fromString(payload)])
@@ -156,11 +168,10 @@ rl.on('line', async (line) => {
     const mode = input.split(' ')[1]
     if (['forge', 'revoked', 'valid'].includes(mode)) {
       attackMode = mode
-      if (attackMode === 'revoked' && blockchain.isOnline) {
-        console.log('⛓️  Registering then immediately revoking on-chain key...')
-        await blockchain.registerKey(MY_ID, publicKey, MY_DID.id)
-        await blockchain.revokeKey(MY_ID, RevocationReason.KEY_COMPROMISE)
-        console.log('🛑 Key revoked on-chain! Ready to test revoked-key attacks.')
+      if (attackMode === 'revoked') {
+        console.log('⛓️  Revoking key on native blockchain...')
+        await blockchain.revokeKey(MY_ID, RevocationReason.KEY_COMPROMISE, privateKey)
+        console.log('🛑 Key marked REVOKED on blockchain! Ready to test revoked-key attacks.')
       }
       console.log(`✅ Attack mode switched to: ${attackMode.toUpperCase()}`)
     } else {

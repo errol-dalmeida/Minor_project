@@ -1,4 +1,4 @@
-import { generateKeyPairSync, createSign, createVerify } from 'crypto'
+import crypto, { generateKeyPairSync, createSign, createVerify, createPrivateKey, createPublicKey, diffieHellman, randomBytes, createCipheriv, createDecipheriv, hkdfSync } from 'crypto'
 
 /**
  * Generate a new ECDSA keypair (NIST P-256 / prime256v1 curve)
@@ -30,6 +30,13 @@ export function createDID(peerId, publicKeyHex) {
       publicKeyHex: publicKeyHex
     }]
   }
+}
+
+/**
+ * Compute SHA-256 hash of string or Buffer
+ */
+export function sha256(data) {
+  return crypto.createHash('sha256').update(data).digest('hex')
 }
 
 /**
@@ -65,7 +72,120 @@ export function verifyMessage(message, signatureHex, publicKeyHex) {
 }
 
 /**
- * Construct a timestamped and nonced message envelope with signature
+ * Compute ECDH Shared Secret from local private key and remote public key
+ */
+export function computeSharedSecret(privateKeyHex, publicKeyHex) {
+  const privateKeyObj = createPrivateKey({
+    key: Buffer.from(privateKeyHex, 'hex'),
+    format: 'der',
+    type: 'pkcs8'
+  })
+  const publicKeyObj = createPublicKey({
+    key: Buffer.from(publicKeyHex, 'hex'),
+    format: 'der',
+    type: 'spki'
+  })
+
+  return diffieHellman({
+    privateKey: privateKeyObj,
+    publicKey: publicKeyObj
+  })
+}
+
+/**
+ * Derive 256-bit AES symmetric key from shared secret using HKDF-SHA256
+ */
+export function deriveKey(sharedSecret, info = 'p2p-e2ee-session') {
+  return hkdfSync('sha256', sharedSecret, '', info, 32)
+}
+
+/**
+ * End-to-End Encrypt a message using ECIES (ECDH + HKDF + AES-256-GCM)
+ * @param {string} plainText Plain text message to encrypt
+ * @param {string} recipientPublicKeyHex Recipient's SPKI DER public key in hex
+ * @param {string} senderPrivateKeyHex Sender's PKCS#8 DER private key in hex
+ * @returns {{ ciphertext: string, iv: string, tag: string }}
+ */
+export function encryptECC(plainText, recipientPublicKeyHex, senderPrivateKeyHex) {
+  const sharedSecret = computeSharedSecret(senderPrivateKeyHex, recipientPublicKeyHex)
+  const aesKey = deriveKey(sharedSecret, 'p2p-e2ee-session')
+
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', aesKey, iv)
+
+  let ciphertext = cipher.update(plainText, 'utf8', 'hex')
+  ciphertext += cipher.final('hex')
+  const tag = cipher.getAuthTag().toString('hex')
+
+  return {
+    ciphertext,
+    iv: iv.toString('hex'),
+    tag
+  }
+}
+
+/**
+ * Decrypt an ECIES-encrypted message
+ * @param {{ ciphertext: string, iv: string, tag: string }} encryptedData
+ * @param {string} senderPublicKeyHex Sender's SPKI DER public key in hex
+ * @param {string} recipientPrivateKeyHex Recipient's PKCS#8 DER private key in hex
+ * @returns {string} Decrypted plaintext string
+ */
+export function decryptECC(encryptedData, senderPublicKeyHex, recipientPrivateKeyHex) {
+  const { ciphertext, iv, tag } = encryptedData
+  const sharedSecret = computeSharedSecret(recipientPrivateKeyHex, senderPublicKeyHex)
+  const aesKey = deriveKey(sharedSecret, 'p2p-e2ee-session')
+
+  const decipher = createDecipheriv('aes-256-gcm', aesKey, Buffer.from(iv, 'hex'))
+  decipher.setAuthTag(Buffer.from(tag, 'hex'))
+
+  let decrypted = decipher.update(ciphertext, 'hex', 'utf8')
+  decrypted += decipher.final('utf8')
+  return decrypted
+}
+
+/**
+ * Generate a random 256-bit symmetric channel key
+ */
+export function generateChannelKey() {
+  return randomBytes(32).toString('hex')
+}
+
+/**
+ * Encrypt a channel message using symmetric AES-256-GCM
+ */
+export function encryptChannelMessage(plainText, channelKeyHex) {
+  const key = Buffer.from(channelKeyHex, 'hex')
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', key, iv)
+
+  let ciphertext = cipher.update(plainText, 'utf8', 'hex')
+  ciphertext += cipher.final('hex')
+  const tag = cipher.getAuthTag().toString('hex')
+
+  return {
+    ciphertext,
+    iv: iv.toString('hex'),
+    tag
+  }
+}
+
+/**
+ * Decrypt a channel message using symmetric AES-256-GCM
+ */
+export function decryptChannelMessage(encryptedData, channelKeyHex) {
+  const { ciphertext, iv, tag } = encryptedData
+  const key = Buffer.from(channelKeyHex, 'hex')
+  const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'hex'))
+  decipher.setAuthTag(Buffer.from(tag, 'hex'))
+
+  let decrypted = decipher.update(ciphertext, 'hex', 'utf8')
+  decrypted += decipher.final('utf8')
+  return decrypted
+}
+
+/**
+ * Construct a timestamped, signed envelope
  */
 export function createMessageEnvelope(text, senderPeerId, privateKeyHex) {
   const payload = {

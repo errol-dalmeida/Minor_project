@@ -1,5 +1,5 @@
 {
-  "address": "0x0B306BF915C4d645ff596e518fAf3F9669b97016",
+  "address": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
   "network": "localhost",
   "rpcUrl": "http://127.0.0.1:8545",
   "chainId": 31337,
@@ -339,5 +339,5 @@
       "type": "function"
     }
   ],
-  "deployedAt": "2026-08-26T11:58:34.689Z"
+  "deployedAt": "2026-08-29T10:14:41.792Z"
 }
