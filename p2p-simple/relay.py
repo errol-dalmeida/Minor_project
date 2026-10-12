@@ -45,6 +45,12 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             if msg_type == "REGISTER_PEER":
                 peer_id = msg.get("peerId")
                 if peer_id:
+                    old_writer = active_peers.get(peer_id)
+                    if old_writer and old_writer != writer:
+                        try:
+                            old_writer.close()
+                        except Exception:
+                            pass
                     existing_peers = [p for p in active_peers.keys() if p != peer_id]
                     active_peers[peer_id] = writer
                     print(f"🔗 Peer connected: {peer_id}")
@@ -64,8 +70,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             }))
 
             elif msg_type == "ROUTED_MSG":
+                if not peer_id or active_peers.get(peer_id) != writer:
+                    continue
                 target = msg.get("target")
-                sender = msg.get("sender")
+                sender = peer_id
+                msg["sender"] = sender
 
                 if target == "*" or target == "broadcast":
                     for pid, w in list(active_peers.items()):
@@ -77,7 +86,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     except Exception:
         pass
     finally:
-        if peer_id and peer_id in active_peers:
+        if peer_id and active_peers.get(peer_id) == writer:
             del active_peers[peer_id]
             print(f"🔌 Peer left:     {peer_id}")
             for pid, w in list(active_peers.items()):

@@ -107,7 +107,7 @@ async def run_modular_tests():
     res_dm = await node_alice.send_direct_message(node_bob.peer_id, dm_text)
     assert res_dm["success"] is True
 
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(1.2)
     # Check Bob's inbox
     bob_inbox = [m for m in node_bob.message_history if m["kind"] == "INCOMING_DM"]
     assert len(bob_inbox) >= 1
@@ -117,13 +117,13 @@ async def run_modular_tests():
     # Alice joins channel and sends message through code function
     await node_alice.join_channel("#research")
     await node_bob.join_channel("#research")
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.5)
 
     ch_text = "Modular channel communication verified."
     res_ch = await node_alice.send_channel_message("#research", ch_text)
     assert res_ch["success"] is True
 
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(1.0)
     bob_ch_inbox = [m for m in node_bob.message_history if m["kind"] == "INCOMING_CHANNEL"]
     assert len(bob_ch_inbox) >= 1
     assert bob_ch_inbox[0]["text"] == ch_text

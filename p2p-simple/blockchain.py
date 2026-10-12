@@ -263,7 +263,12 @@ class NativeBlockchain:
             ok = tx_obj.verify(record["publicKeyHex"])
             return {"valid": True} if ok else {"valid": False, "error": "Invalid signature for key rotation"}
 
-        return {"valid": True}
+        if tx_obj.type == TransactionType.DATA:
+            if not record or record.get("isRevoked"):
+                return {"valid": False, "error": "Data transaction requires an active registered identity"}
+            return ({"valid": True} if tx_obj.verify(record["publicKeyHex"])
+                    else {"valid": False, "error": "Invalid signature on data transaction"})
+        return {"valid": False, "error": "Unsupported transaction type"}
 
     validateTransaction = validate_transaction
 
@@ -365,6 +370,12 @@ class NativeBlockchain:
         Submit transaction to mempool and immediately produce a block.
         """
         tx_obj = tx if isinstance(tx, Transaction) else Transaction.from_dict(tx)
+        tx_hash = tx_obj.calculate_hash()
+        for confirmed_block in self.chain:
+            for confirmed_tx in confirmed_block.transactions:
+                if confirmed_tx.calculate_hash() == tx_hash:
+                    return {"success": True, "duplicate": True, "txHash": tx_hash,
+                            "block": confirmed_block, "transaction": confirmed_tx}
         check = self.validate_transaction(tx_obj)
         if not check.get("valid"):
             return {"success": False, "error": check.get("error")}
@@ -435,22 +446,27 @@ class NativeBlockchain:
     def is_valid_chain(self, chain: List[Union[Block, Dict[str, Any]]]) -> bool:
         if not isinstance(chain, list) or len(chain) == 0:
             return False
-        genesis = self.create_genesis_block()
-
-        first_block = chain[0] if isinstance(chain[0], Block) else Block.from_dict(chain[0])
-        if first_block.hash != genesis.hash:
+        try:
+            blocks = [b if isinstance(b, Block) else Block.from_dict(b) for b in chain]
+            if blocks[0].to_dict() != self.create_genesis_block().to_dict():
+                return False
+            validator = NativeBlockchain(difficulty=self.difficulty)
+            seen_hashes = set()
+            for i, current in enumerate(blocks[1:], 1):
+                previous = blocks[i - 1]
+                if (current.index != i or current.previousHash != previous.hash
+                        or current.calculate_hash() != current.hash
+                        or not current.hash.startswith("0" * self.difficulty)):
+                    return False
+                for tx in current.transactions:
+                    tx_hash = tx.calculate_hash()
+                    if tx_hash in seen_hashes or not validator.validate_transaction(tx).get("valid"):
+                        return False
+                    seen_hashes.add(tx_hash)
+                    validator.apply_transaction_to_state(tx)
+            return True
+        except (AttributeError, KeyError, TypeError, ValueError):
             return False
-
-        for i in range(1, len(chain)):
-            current = chain[i] if isinstance(chain[i], Block) else Block.from_dict(chain[i])
-            previous = chain[i - 1] if isinstance(chain[i - 1], Block) else Block.from_dict(chain[i - 1])
-
-            if current.previousHash != previous.hash:
-                return False
-            if current.calculate_hash() != current.hash:
-                return False
-
-        return True
 
     isValidChain = is_valid_chain
 

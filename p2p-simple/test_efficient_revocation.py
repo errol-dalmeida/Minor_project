@@ -129,6 +129,8 @@ async def run_benchmark():
     # ── 2. Start All Nodes (connect to relay) ───────────────────────────
     print("\n  ⚡ Starting nodes...\n")
     for node in nodes:
+        await node.join_channel("#dev" if node in (alice, bob) else "#marketing")
+        await node.leave_channel("#general")
         await node.start()
         await asyncio.sleep(0.3)
 
@@ -149,27 +151,12 @@ async def run_benchmark():
     await bob.join_channel("#dev")
     await asyncio.sleep(0.5)
 
-    # Initialize channel_members sets and register membership
-    alice.channel_members.setdefault("#dev", set()).add(bob.peer_id)
-    bob.channel_members.setdefault("#dev", set()).add(alice.peer_id)
-
     # Charlie and Dave share #marketing (no overlap with Alice)
     await charlie.join_channel("#marketing")
     await dave.join_channel("#marketing")
     await asyncio.sleep(0.5)
-    charlie.channel_members.setdefault("#marketing", set()).add(dave.peer_id)
-    dave.channel_members.setdefault("#marketing", set()).add(charlie.peer_id)
-
-    # Cross-register keys so nodes can resolve each other on-chain
-    for src in nodes:
-        for dst in nodes:
-            if src.peer_id != dst.peer_id:
-                dst.key_registry[src.peer_id] = src.public_key
-                # Register src on dst's local chain
-                await dst.blockchain.register_key(
-                    src.peer_id, src.public_key,
-                    f"did:peer:{src.peer_id}", src.private_key
-                )
+    # Keys and memberships must be discovered through real protocol messages.
+    assert all(all(src.peer_id in dst.blockchain.state for src in nodes) for dst in nodes)
 
     # Verify interaction graph scoping
     alice_contacts = alice.get_active_contacts()
@@ -300,7 +287,7 @@ async def run_benchmark():
     assert_test(
         "Charlie's trust for Alice is now 0",
         charlie.trust_scores.get(alice.peer_id, -1) == 0,
-        "Security 100% preserved without broadcast"
+        "Revoked recipient was discovered without a pushed revocation packet"
     )
 
     # ════════════════════════════════════════════════════════════════════
