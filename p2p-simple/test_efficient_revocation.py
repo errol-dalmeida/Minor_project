@@ -59,7 +59,7 @@ def assert_test(name: str, condition: bool, detail: str = ""):
 
 class PacketSniffer:
     """
-    Wraps a PeerNode's relay listener to count /chain/tx/1.0.0 packets
+    Wraps a PeerNode's protocol dispatch to count /chain/tx/1.0.0 packets
     received by each peer. This is the 'wire-level' counter that proves
     scoped delivery.
     """
@@ -79,13 +79,12 @@ class PacketSniffer:
 sniffer = PacketSniffer()
 
 
-# ─── Patched Relay Listener (Instrumented with Sniffer) ─────────────────
+# ─── Instrumented Protocol Dispatch ───────────────────────────────────
 
 def make_instrumented_listener(node: PeerNode):
     """
-    Returns a coroutine that reads from the relay like the normal listener,
-    but also feeds every incoming ROUTED_MSG into the PacketSniffer before
-    dispatching it to the node's protocol handler.
+    Feeds incoming direct protocol messages into the PacketSniffer before
+    dispatching them to the node's existing handler.
     """
     original_dispatch = node._dispatch_protocol
 
@@ -126,7 +125,7 @@ async def run_benchmark():
     for node in nodes:
         make_instrumented_listener(node)
 
-    # ── 2. Start All Nodes (connect to relay) ───────────────────────────
+    # ── 2. Start All Nodes (bootstrap discovery, then direct connections)
     print("\n  ⚡ Starting nodes...\n")
     for node in nodes:
         await node.join_channel("#dev" if node in (alice, bob) else "#marketing")
@@ -134,7 +133,7 @@ async def run_benchmark():
         await node.start()
         await asyncio.sleep(0.3)
 
-    # Allow relay PEER_LIST and PEER_JOINED exchanges to settle
+    # Allow discovery and direct identity/channel exchanges to settle
     await asyncio.sleep(2.0)
     print()
 
@@ -185,7 +184,7 @@ async def run_benchmark():
     rev_result = await alice.revoke_key(reason=RevocationReason.KEY_COMPROMISE)
     assert_test("Alice's revocation succeeded on-chain", rev_result.get("success") is True)
 
-    # Give relay time to deliver scoped packets
+    # Give direct connections time to deliver scoped packets
     await asyncio.sleep(1.5)
 
     # Count how many scoped packets Alice sent

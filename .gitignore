@@ -7,3 +7,21 @@ artifacts/
 __pycache__/
 *.pyc
 peer_identity_*.json
+*_identity.json
+test_id_*.json
+.venv/
+venv/
+tmp/
+minor-lan-source.zip
+minor-lan-source.tar.gz
+
+# Publish only the latest report and execution guide.
+output/*
+!output/documents/
+!output/pdf/
+output/documents/*
+output/pdf/*
+!output/documents/Updated_Final_Project_Report.docx
+!output/documents/Project_Execution_Guide.docx
+!output/pdf/Updated_Final_Project_Report.pdf
+!output/pdf/Project_Execution_Guide.pdf

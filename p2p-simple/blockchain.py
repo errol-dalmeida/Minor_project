@@ -184,7 +184,8 @@ class NativeBlockchain:
             "onKeyRevoked": [],
             "onKeyUnrevoked": [],
             "onKeyRotated": [],
-            "onBlockAdded": []
+            "onBlockAdded": [],
+            "onMessageReceipt": []
         }
         self.isOnline = True
 
@@ -361,6 +362,19 @@ class NativeBlockchain:
                     "oldKey": old_key,
                     "newKey": payload.get("newPublicKeyHex"),
                     "timestamp": timestamp
+                })
+
+        elif tx_type == TransactionType.DATA:
+            if isinstance(payload, dict) and payload.get("action") == "MESSAGE_RECEIPT":
+                recip = payload.get("recipientPeerId", payload.get("target", "*"))
+                msg_type = payload.get("msgType", "CHANNEL" if str(recip).startswith("#") else ("BROADCAST" if recip == "*" else "DM"))
+                self.emit("onMessageReceipt", {
+                    "sender": sender,
+                    "recipient": recip,
+                    "msgType": msg_type,
+                    "messageHash": payload.get("messageHash"),
+                    "timestamp": timestamp,
+                    "txHash": tx_obj.calculate_hash()
                 })
 
     applyTransactionToState = apply_transaction_to_state
@@ -577,8 +591,86 @@ class NativeBlockchain:
 
     getKeyHistory = get_key_history
 
+    async def commit_message_receipt(
+        self,
+        sender_peer_id: str,
+        recipient_peer_id: str,
+        message_hash: str,
+        private_key_hex: str,
+        msg_type: str = "DM"
+    ) -> Dict[str, Any]:
+        """Commit a tamper-evident message receipt to the native blockchain."""
+        tx = Transaction(
+            type=TransactionType.DATA,
+            senderPeerId=sender_peer_id,
+            payload={
+                "action": "MESSAGE_RECEIPT",
+                "msgType": msg_type,
+                "recipientPeerId": recipient_peer_id,
+                "target": recipient_peer_id,
+                "messageHash": message_hash
+            }
+        )
+        tx.sign(private_key_hex)
+        res = self.add_transaction(tx)
+        res["transaction"] = tx
+        return res
+
+    commitMessageReceipt = commit_message_receipt
+
+    def get_message_receipts(self, peer_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieve all message receipts from the blockchain, optionally filtered by peer_id."""
+        receipts = []
+        for block in self.chain:
+            for tx in block.transactions:
+                if tx.type == TransactionType.DATA and isinstance(tx.payload, dict) and tx.payload.get("action") == "MESSAGE_RECEIPT":
+                    sender = tx.senderPeerId
+                    recipient = tx.payload.get("recipientPeerId", tx.payload.get("target", "*"))
+                    msg_type = tx.payload.get("msgType", "CHANNEL" if str(recipient).startswith("#") else ("BROADCAST" if recipient == "*" else "DM"))
+                    if peer_id is None or peer_id in (sender, recipient) or recipient in ("*", "#all") or str(recipient).startswith("#"):
+                        receipts.append({
+                            "blockIndex": block.index,
+                            "blockHash": block.hash,
+                            "txHash": tx.calculate_hash(),
+                            "sender": sender,
+                            "recipient": recipient,
+                            "target": recipient,
+                            "msgType": msg_type,
+                            "messageHash": tx.payload.get("messageHash"),
+                            "timestamp": tx.timestamp
+                        })
+        return receipts
+
+    getMessageReceipts = get_message_receipts
+
+    def verify_message_receipt(self, message_hash: str) -> Optional[Dict[str, Any]]:
+        """Check if a specific message hash was anchored in any block."""
+        for block in self.chain:
+            for tx in block.transactions:
+                if (tx.type == TransactionType.DATA and 
+                    isinstance(tx.payload, dict) and
+                    tx.payload.get("action") == "MESSAGE_RECEIPT" and
+                    tx.payload.get("messageHash") == message_hash):
+                    recip = tx.payload.get("recipientPeerId", tx.payload.get("target", "*"))
+                    msg_type = tx.payload.get("msgType", "CHANNEL" if str(recip).startswith("#") else ("BROADCAST" if recip == "*" else "DM"))
+                    return {
+                        "verified": True,
+                        "blockIndex": block.index,
+                        "blockHash": block.hash,
+                        "txHash": tx.calculate_hash(),
+                        "sender": tx.senderPeerId,
+                        "recipient": recip,
+                        "target": recip,
+                        "msgType": msg_type,
+                        "messageHash": message_hash,
+                        "timestamp": tx.timestamp
+                    }
+        return None
+
+    verifyMessageReceipt = verify_message_receipt
+
     def subscribe_events(self, handlers: Dict[str, Any]) -> None:
-        for ev in ["onKeyRegistered", "onKeyRevoked", "onKeyUnrevoked", "onKeyRotated", "onBlockAdded"]:
+        for ev in ["onKeyRegistered", "onKeyRevoked", "onKeyUnrevoked", "onKeyRotated", "onBlockAdded", "onMessageReceipt"]:
             if ev in handlers and callable(handlers[ev]):
                 self.listeners[ev].append(handlers[ev])
 

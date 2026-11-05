@@ -1,8 +1,11 @@
 # Python P2P Communication and Native Blockchain DPKI
 
 The current implementation runs entirely in terminals. Each Python peer owns its
-keys, DID, local blockchain, trust state, and revocation cache. A TCP relay routes
-messages between peers on the same computer or LAN. The Python path does not use
+keys, DID, local blockchain, trust state, and revocation cache. An optional TCP
+bootstrap relay introduces peers by exchanging listening addresses. All messages,
+key updates and chain synchronization then use direct TCP connections between
+peers. Stopping the bootstrap does not interrupt established peer connections.
+The Python path does not use
 EVM, Hardhat, or the JavaScript libp2p implementation retained in this repository.
 
 Direct messages use ECIES (ECDH plus a symmetric AEAD cipher), with ECDSA signatures.
@@ -46,14 +49,18 @@ Requirements:
   rule. Run the relay and peers as your normal user.
 - Internet access for the initial APT/PyPI installation. The running application
   uses LAN TCP connections and does not need an external blockchain or RPC service.
-- Inbound TCP `4001` allowed on the relay device. Peers need outbound TCP access
-  to that address and port; replies use the established connection.
+- Inbound TCP `4001` allowed on the bootstrap device during discovery.
+- Inbound TCP `5001` allowed on **every peer device** for the commands below.
+  Peers need outbound access to one another's direct listening ports as well as
+  the optional bootstrap. Multiple peers on one computer need distinct listening
+  ports; peers on different devices can all use `5001`.
 - A separate identity file for each peer and an interactive terminal for its CLI.
 
 `peer.py` launches `peer_cli.py`; both accept the same options. `--port 8501`
-selects `peer_identity_8501.json`; it **does not open TCP port 8501**. Ports 8501,
-8502, and 8503 do not need inbound firewall rules. The network service is the
-relay on TCP 4001.
+selects `peer_identity_8501.json`; it **does not open TCP port 8501**.
+`--listen-port 5001` is the actual peer TCP listener. Omitting `--listen-port`
+chooses an available port, which is convenient for local tests but harder to
+configure in a LAN firewall.
 
 ## 1. Install Debian packages on every device
 
@@ -180,9 +187,9 @@ If installation reports an unsupported Rust version, install the toolchain
 required by the [cryptography installation guide](https://cryptography.io/en/stable/installation/#rust)
 and retry inside `.venv`. These build packages are only needed for a source build.
 
-## 4. Find the relay's LAN address and allow its TCP port
+## 4. Find every device's LAN address and allow discovery and peer TCP ports
 
-On Device A:
+On every device:
 
 ```bash
 ip -br -4 address
@@ -190,21 +197,27 @@ ip -4 route
 ```
 
 Choose the IPv4 address on the Ethernet/Wi-Fi interface used by Devices B and C,
-for example `192.168.1.100`. Peer devices use that address in `--relay`.
-`127.0.0.1` refers to the device running the command, so it is appropriate for
-Node 1 on Device A, while remote peers use Device A's LAN address.
+for example `192.168.1.100` on Device A. Peers use Device A's address in `--relay`,
+and their own device's address in `--advertise-host`. A remote peer cannot reach
+your listener at `127.0.0.1`; that address is for single-computer tests.
 
-Keep the relay address stable during the test. A router DHCP reservation is
+Keep the device addresses stable during the test. A router DHCP reservation is
 useful for repeat runs; otherwise recheck the address after reconnecting Wi-Fi.
-For a relay inside a VM, configure a reachable bridged LAN interface or forward
-the relay's TCP port through the VM host.
+For peers or the bootstrap inside VMs, configure reachable bridged LAN interfaces
+or forward the corresponding TCP listening ports through their VM hosts.
 
-If **UFW already manages the relay host**, check it and add a LAN-scoped rule:
+If **UFW already manages the devices**, allow direct connections on every peer:
 
 ```bash
 sudo ufw status verbose
-sudo ufw allow proto tcp from 192.168.1.0/24 to any port 4001 comment 'P2P relay LAN'
+sudo ufw allow proto tcp from 192.168.1.0/24 to any port 5001 comment 'P2P direct peers LAN'
 sudo ufw status numbered
+```
+
+On Device A, also allow bootstrap discovery:
+
+```bash
+sudo ufw allow proto tcp from 192.168.1.0/24 to any port 4001 comment 'P2P bootstrap LAN'
 ```
 
 Replace `192.168.1.0/24` with your actual LAN subnet. If you choose UFW for a
@@ -221,13 +234,14 @@ Use your actual SSH port if it differs from 22. UFW activation changes the host'
 firewall policy; [Debian's UFW manual](https://manpages.debian.org/trixie/ufw/ufw.8.en.html#REMOTE_MANAGEMENT)
 explains remote-management rules. An inactive UFW instance does not enforce its
 rules. If nftables or firewalld already manages this device, use that manager to
-allow LAN clients to reach TCP 4001.
+allow LAN clients to reach TCP 5001 on peers and TCP 4001 on the bootstrap host.
 
 On hosts with restricted outbound rules, also allow peer connections to the
-relay's IPv4 address on TCP 4001. No router Internet port forwarding is needed
+bootstrap's IPv4 address on TCP 4001 and other peers on TCP 5001.
+No router Internet port forwarding is needed
 for devices that can already reach each other on the LAN.
 
-## 5. Start exactly one relay on Device A
+## 5. Start a discovery bootstrap on Device A
 
 In Device A's **first terminal**:
 
@@ -238,7 +252,8 @@ RELAY_HOST=0.0.0.0 RELAY_PORT=4001 python relay.py
 ```
 
 Expected output includes `Relay running` and addresses ending in `/tcp/4001/...`.
-Keep this terminal running. Peers take `IPv4:port`, such as
+Keep this terminal running while the initial peers discover each other. It can
+be stopped once direct connections are established. Peers take `IPv4:port`, such as
 `192.168.1.100:4001`, rather than the full printed `/ip4/.../p2p/...` string.
 
 In another terminal on Device A, confirm the listener:
@@ -272,7 +287,7 @@ On Device A, in its **second terminal**:
 cd ~/minor-lan/p2p-simple
 source .venv/bin/activate
 umask 077
-python peer.py --port 8501 --relay 127.0.0.1:4001
+python peer.py --port 8501 --listen-port 5001 --advertise-host 192.168.1.100 --relay 192.168.1.100:4001
 ```
 
 On Device B:
@@ -281,7 +296,7 @@ On Device B:
 cd ~/minor-lan/p2p-simple
 source .venv/bin/activate
 umask 077
-python peer.py --port 8502 --relay 192.168.1.100:4001
+python peer.py --port 8502 --listen-port 5001 --advertise-host 192.168.1.101 --relay 192.168.1.100:4001
 ```
 
 On Device C:
@@ -290,13 +305,13 @@ On Device C:
 cd ~/minor-lan/p2p-simple
 source .venv/bin/activate
 umask 077
-python peer.py --port 8503 --relay 192.168.1.100:4001
+python peer.py --port 8503 --listen-port 5001 --advertise-host 192.168.1.102 --relay 192.168.1.100:4001
 ```
 
-Replace the remote relay IP in both commands. `umask 077` makes newly created
+Replace all example IPs with your actual device addresses. `umask 077` makes newly created
 identity files accessible to their owner. Each terminal should print its peer ID,
-`Connected to relay`, and a CLI prompt. The relay should report three connected
-peers. Allow the initial key and chain exchanges to finish, then enter these
+`Peer listening`, and a CLI prompt. Discovery events appear in the background.
+Allow the direct connections and initial key and chain exchanges to finish, then enter these
 commands **inside every peer CLI**:
 
 ```text
@@ -310,8 +325,33 @@ Each peer should list two other connected peers. Copy the full peer IDs into
 your test notes as `Node1PeerId`, `Node2PeerId`, and `Node3PeerId`. Replace every
 `<Node...PeerId>` placeholder below with that actual ID; omit the angle brackets.
 
-Keep each CLI in the foreground. A peer launched before the relay may enter
-offline mode; start the relay, then exit and relaunch that peer.
+Keep each CLI in the foreground. Peers start listening even when the bootstrap
+is unavailable and retry discovery in the background. Existing direct links use
+heartbeats and reconnect to known addresses independently of the bootstrap.
+
+From another device, check each running peer's listener, for example:
+
+```bash
+nc -4 -vz -w 3 192.168.1.101 5001
+```
+
+For several peers on one computer, use `--advertise-host 127.0.0.1` and different
+`--listen-port` values, such as `5001`, `5002`, and `5003`.
+
+### Join through an existing peer when the bootstrap is stopped
+
+A new or restarted peer can contact any known running member. For example, after
+stopping Node 3, restart it on Device C using Node 1's **peer port**, not port 4001:
+
+```bash
+python peer.py --port 8503 --listen-port 5001 --advertise-host 192.168.1.102 --no-relay --peer 192.168.1.100:5001
+```
+
+The contacted peer supplies other live peer addresses; Node 3 connects to them
+directly. Repeat `--peer HOST:PORT` to supply more seed addresses. A fresh network
+can also start without any bootstrap: start the first peer with `--no-relay`,
+then give its address to subsequent peers. A newcomer needs either a reachable
+bootstrap or at least one reachable peer address.
 
 ## 8. Run the tests across the actual LAN devices
 
@@ -414,7 +454,7 @@ dm <Node1PeerId> reply-from-device-B
 ```
 
 Node 1 should display the reply. A successful send means the sender wrote the
-packet to the relay; the recipient's displayed message confirms application
+packet to the direct peer connection; the recipient's displayed message confirms application
 delivery and verification.
 
 ### Test C: channel delivery
@@ -474,10 +514,20 @@ from its Linux shell using the same command, directory, and identity file as in
 step 7. Its peer ID should remain the same, and `peers` should again show two
 other nodes. Use `join #dev` again if you want to restore that channel membership.
 
-For a relay restart test, press `Ctrl+C` in Device A's relay terminal, leaving
-the peer terminals running. Start the relay again with the command in step 5.
-Already-connected peers should report disconnection and retry the relay roughly
-every two seconds. Once reconnected, verify `peers` and send another DM.
+For the bootstrap-independence test, press `Ctrl+C` in Device A's relay terminal,
+leaving all peer terminals running. Keep the bootstrap stopped throughout:
+
+1. Run `peers` on every node; existing peers and channel memberships must remain.
+2. Exchange DMs, channel messages and broadcasts, checking recipient output.
+3. Run `revoke`, verify that contacts receive the update and reject messages,
+   then run `unrevoke` and verify communication resumes.
+4. Run `rotate` and send another DM using the updated key.
+5. Run `refresh <peerId>` and inspect `receipts` to check direct synchronization.
+6. Restart a peer with `--no-relay --peer HOST:PORT` as shown above and verify it rejoins.
+
+You may then restart the bootstrap. Its disconnection/reconnection must not
+clear direct-peer state or duplicate delivered messages. Discovery retries are
+independent of peer reconnection attempts.
 
 Record the result of Tests A-F, the devices' IPs, peer IDs, Python/cryptography
 versions, and any failed command or receiver output. This distinguishes a LAN
@@ -507,10 +557,36 @@ connectivity failure from a key, cache, or messaging failure.
 | `exit` / `quit` | Disconnect and stop the peer |
 
 Use crypto settings that match on communicating peers. Cipher/hash changes are
-not negotiated automatically. A successful send means the relay accepted the
-write; the receiving terminal separately prints the verified incoming message.
+not negotiated automatically. A successful send means a direct connection
+accepted the write; the receiving terminal separately prints the verified incoming message.
 
 ## Identity persistence and cache behavior
+
+### Saved peer identities on a device
+
+When launched from the source directory, peers started with the identity selectors
+8501, 8502, 8503 and 8504 save their credentials in
+`p2p-simple/peer_identity_8501.json` through `p2p-simple/peer_identity_8504.json`.
+These files contain private keys and remain local; they are excluded from Git.
+They are credentials, not running processes. Relaunch from the same directory
+with the same `--port` value to reuse that identity.
+
+Relative identity paths are resolved against the shell's current directory.
+Use `--id-file /absolute/private/path/alice_identity.json` if you need a stable
+location independent of the directory from which you launch the program.
+Custom identity filenames also need a Git ignore rule if placed inside the
+repository. Keep private backups separately from the source distribution.
+Do not copy one identity onto simultaneously running peers.
+
+An ordinary Git update preserves these ignored files. A fresh clone does not
+contain them and generates new identities on first use. Avoid commands such as
+`git clean -fdx` in a working copy containing saved identities: they remove
+ignored local files. The older tracked `did-12D3KooW.json` contains public DID
+metadata, not a Python peer's private identity.
+
+Latest deliverables: [project report](output/documents/Updated_Final_Project_Report.docx)
+and [execution guide](output/documents/Project_Execution_Guide.docx), with PDF
+copies in `output/pdf/`.
 
 Peer IDs and keys survive restarts in their identity JSON files. Channel
 memberships, DM history, trust state, cached statuses, and ledgers are in memory.
@@ -530,8 +606,9 @@ create a fresh active entry. This cache policy does not guarantee instantaneous
 revocation knowledge for every disconnected or unrelated peer.
 
 Channel keys currently derive from public channel names. These are demonstration
-groups, not access-controlled private rooms. The native ledger and single relay
-are a LAN prototype; this is not a production consensus or routing system.
+groups, not access-controlled private rooms. The native ledger and direct mesh
+are a LAN prototype; the consensus and cryptographic rules have not changed with
+the discovery-only bootstrap. Initial discovery still needs an address source.
 
 ## Automated verification
 
@@ -541,6 +618,7 @@ On each Debian device, use another terminal and the environment from step 3:
 cd ~/minor-lan/p2p-simple
 source .venv/bin/activate
 python test_peer_revocation_regressions.py
+python test_message_receipts.py
 python test_efficient_revocation.py
 python test_modular_crypto.py
 python test_dpki.py
@@ -549,15 +627,19 @@ python test_network_e2e.py
 
 The regression suite covers stale caches, reinstatement, TTL expiry, forged
 transactions, signature checks, delayed and missing chain replies, shorter forks,
-relay reconnection, and a real three-node revoke/block/reinstate/resume sequence.
+bootstrap reconnection without disrupting direct state, and a real three-node
+revoke/block/reinstate/resume sequence. `test_network_e2e.py` runs the direct-mesh
+suite in `test_direct_mesh.py`: discovery refuses message forwarding, broadcasts
+arrive once, and messaging, receipts, key lifecycle operations, chain refresh,
+reconnection and peer exchange work after the bootstrap is stopped.
 The scoped benchmark uses four peers in separate groups and checks packet counts
 without manually injecting peer keys or channel memberships.
 
 These scripts start isolated localhost test relays. They check application
 behavior but do not prove that separate LAN devices can communicate. Complete
-the manual LAN tests in step 8 as well. The network scripts use test ports 4009,
-4015, 4099, and an automatically assigned port; they do not replace the live
-relay on 4001.
+the manual LAN tests in step 8 as well. The network scripts use automatically
+assigned ports and benchmark/cryptography test ports 4099 and 4015; they do not replace
+the live bootstrap on 4001.
 
 ## Troubleshooting on Debian
 
@@ -572,7 +654,9 @@ relay on 4001.
 | `nc` reports connection refused | Start the relay, verify its IP/port, and check `ss -ltnp 'sport = :4001'` on the relay device. Check for firewall rejection as well. |
 | `nc` times out | Check the subnet, route, relay firewall, AP/client isolation, and any VM networking. The remote endpoint must be the relay's LAN IP. |
 | Relay cannot bind because port 4001 is in use | Check the listener with `ss`; use the intended existing relay or select another `RELAY_PORT` and update every peer endpoint and firewall rule. |
-| Peer says it is running offline | Verify TCP connectivity and restart the peer after the relay is available. |
+| Bootstrap is unavailable | Existing connections continue. For initial discovery, start it or use `--no-relay --peer HOST:PORT` with a known peer listener. |
+| Discovery works but `peers` stays empty | Check each peer's `--advertise-host`, inbound TCP 5001 and AP/client isolation. On each device run `ss -ltnp 'sport = :5001'`; test from another device with `nc -4 -vz -w 3 PEER_IP 5001`. |
+| Peer listener cannot start | Choose an unused `--listen-port` and a local `--listen-host`; multiple peers on one device need distinct ports. |
 | A peer repeatedly disconnects when another launches | Check that the two processes are not sharing a copied identity JSON file. Relaunch the affected test peer with an unused `--id-file` name. |
 | DM target is not found | Use the peer ID from `peers`, rather than its IP address. Copy the full ID to avoid an ambiguous short prefix. |
 | Channel decryption fails | Match crypto settings on all participants using `crypto sha256 aes-gcm`; verify that each receiver joined the channel. |
@@ -584,6 +668,6 @@ relay on 4001.
 ## Shut down and restart
 
 Enter `exit` in each peer CLI, then press `Ctrl+C` in the relay terminal.
-To restart, activate the environment in every terminal, start the relay first,
-and rerun the device-specific peer commands from step 7. Run `deactivate` in a
+To restart, activate the environment in every terminal and rerun the peer commands
+from step 7. Supply a running bootstrap or use a known peer address. Run `deactivate` in a
 Linux shell when you have finished using its virtual environment.

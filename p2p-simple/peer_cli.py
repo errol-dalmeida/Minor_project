@@ -10,7 +10,7 @@ Fully decentralized sovereign peer node terminal interface with:
 - On-demand lazy revocation verification with local TTL caching
 - Modular hot-swappable cryptographic suite (Strategy Pattern)
 - Dynamic trust matrix and peer presence tracking
-- Full LAN multi-device support via relay
+- Direct LAN peer connections with optional bootstrap discovery
 """
 
 import argparse
@@ -70,11 +70,15 @@ def c(text: str, color: str) -> str:
 class PeerNodeCLI:
     def __init__(
         self,
-        relay_host: str = "127.0.0.1",
+        relay_host: Optional[str] = "127.0.0.1",
         relay_port: int = 4001,
         identity_file: Optional[str] = None,
         peer_id: Optional[str] = None,
-        initial_channel: str = "#general"
+        initial_channel: str = "#general",
+        listen_host: str = "0.0.0.0",
+        listen_port: int = 0,
+        advertise_host: Optional[str] = None,
+        seed_peers: Optional[List[tuple]] = None,
     ):
         self.relay_host = relay_host
         self.relay_port = relay_port
@@ -83,7 +87,11 @@ class PeerNodeCLI:
             peer_id=peer_id,
             relay_host=relay_host,
             relay_port=relay_port,
-            identity_file=identity_file
+            identity_file=identity_file,
+            listen_host=listen_host,
+            listen_port=listen_port,
+            advertise_host=advertise_host,
+            seed_peers=seed_peers,
         )
         if initial_channel and initial_channel != "#general":
             if not initial_channel.startswith("#"):
@@ -141,6 +149,16 @@ class PeerNodeCLI:
                       f"{c(f'📦 BLOCK #{idx} MINED & COMMITTED', Colors.CYAN)} | Hash: {h}... | Transactions: {tx_len}")
                 self._print_prompt()
 
+            elif ev_type == "onMessageReceipt":
+                s = str(data.get("sender", ""))[:16]
+                r = str(data.get("recipient", ""))[:16]
+                mh = str(data.get("messageHash", ""))[:18]
+                m_type = data.get("msgType", "DM")
+                print(f"\n{c(f'[{ts}] ⛓️  [BLOCKCHAIN UPDATE]', Colors.CYAN + Colors.BOLD)} "
+                      f"{c(f'📜 MESSAGE RECEIPT ANCHORED [{m_type}]', Colors.GREEN + Colors.BOLD)} | "
+                      f"From: {c(s + '...', Colors.YELLOW)} ➔ Target: {c(r + '...', Colors.YELLOW)} | Hash: {c(mh + '...', Colors.WHITE)}")
+                self._print_prompt()
+
             elif ev_type == "onChainSynced":
                 old_h = data.get("oldHeight", 0)
                 new_h = data.get("newHeight", 0)
@@ -154,16 +172,17 @@ class PeerNodeCLI:
             sender = msg.get("sender", "")
             target = msg.get("target", "")
             text = msg.get("text", "")
+            anchored_badge = c(" [⛓️ ANCHORED ON-CHAIN]", Colors.GREEN + Colors.BOLD) if msg.get("receipt") else ""
 
             if kind == "INCOMING_DM":
                 print(f"\n{c(f'[{ts}] 🔒 [INCOMING DM (ECIES)]', Colors.GREEN + Colors.BOLD)} "
-                      f"From {c(sender[:16] + '...', Colors.YELLOW)}: {c(text, Colors.WHITE + Colors.BOLD)}")
+                      f"From {c(sender[:16] + '...', Colors.YELLOW)}: {c(text, Colors.WHITE + Colors.BOLD)}{anchored_badge}")
             elif kind == "INCOMING_CHANNEL":
                 print(f"\n{c(f'[{ts}] 📢 [CHANNEL {target}]', Colors.CYAN + Colors.BOLD)} "
-                      f"{c(sender[:16] + '...', Colors.YELLOW)}: {c(text, Colors.WHITE)}")
+                      f"{c(sender[:16] + '...', Colors.YELLOW)}: {c(text, Colors.WHITE)}{anchored_badge}")
             elif kind == "INCOMING_BROADCAST":
                 print(f"\n{c(f'[{ts}] 📤 [PUBLIC BROADCAST]', Colors.BLUE + Colors.BOLD)} "
-                      f"{c(sender[:16] + '...', Colors.YELLOW)}: {c(text, Colors.WHITE)}")
+                      f"{c(sender[:16] + '...', Colors.YELLOW)}: {c(text, Colors.WHITE)}{anchored_badge}")
             self._print_prompt()
 
         def handle_peer_event(event_type: str, pid: str):
@@ -178,11 +197,11 @@ class PeerNodeCLI:
                 self._print_prompt()
             elif event_type == "RELAY_DISCONNECTED":
                 print(f"\n{c(f'[{ts}] ⚠️ [NETWORK]', Colors.RED + Colors.BOLD)} "
-                      f"{c('Disconnected from Relay! Reconnecting in background...', Colors.RED)}")
+                      f"{c('Discovery unavailable; direct peer connections continue.', Colors.YELLOW)}")
                 self._print_prompt()
             elif event_type == "RELAY_CONNECTED":
                 print(f"\n{c(f'[{ts}] 🔗 [NETWORK]', Colors.GREEN + Colors.BOLD)} "
-                      f"{c('Reconnected to Relay successfully!', Colors.GREEN)}")
+                      f"{c('Discovery bootstrap connected.', Colors.GREEN)}")
                 self._print_prompt()
 
         self.node.on_blockchain_event = handle_blockchain_event
@@ -217,7 +236,8 @@ class PeerNodeCLI:
             print(f"  • {c('Identity Status', Colors.BOLD):<18}: {c('✅ ACTIVE (REGISTERED ON-CHAIN)', Colors.GREEN + Colors.BOLD)}")
 
         print(f"  • {c('Crypto Suite', Colors.BOLD):<18}: {c(self.node.crypto_suite.get_descriptor(), Colors.MAGENTA)}")
-        print(f"  • {c('Relay Server', Colors.BOLD):<18}: {self.relay_host}:{self.relay_port}")
+        print(f"  • {c('Bootstrap', Colors.BOLD):<18}: {self.relay_host or 'disabled'}"
+              + (f":{self.relay_port}" if self.relay_host else ""))
         print(f"  • {c('Active Channel', Colors.BOLD):<18}: {c(self.node.active_channel, Colors.CYAN)}")
         print(f"  • {c('Joined Channels', Colors.BOLD):<18}: {', '.join(sorted(self.node.joined_channels))}")
         print(c("-" * 70, Colors.DIM))
@@ -228,6 +248,7 @@ class PeerNodeCLI:
         print(c("\n📜 Available CLI Commands:", Colors.CYAN + Colors.BOLD))
         commands = [
             ("@<peerId> <msg>", "Send confidential 1-on-1 E2EE direct message (ECIES)"),
+            ("anchor-dm <id> <msg>", "Send ECIES DM and anchor cryptographic proof receipt on blockchain"),
             ("dm <peerId> <msg>", "Alternative syntax for ECIES direct message"),
             ("#<channel> <msg>", "Send encrypted message to specific channel (e.g. #dev hello)"),
             ("<message>", f"Send encrypted message to currently active channel ({self.node.active_channel})"),
@@ -241,6 +262,8 @@ class PeerNodeCLI:
             ("rotate", "Generate new keypair and rotate on-chain with scoped gossip"),
             ("lookup <peerId>", "Query blockchain record & full key rotation history for a peer"),
             ("refresh <peerId>", "Pull current key status from a peer, bypassing the TTL cache"),
+            ("receipts / audit", "View all on-chain message receipts and audit proofs"),
+            ("verify-receipt <h/msg>", "Verify a message hash or text against on-chain notarization"),
             ("chain / blocks", "Explore native blockchain height, difficulty, blocks, and transactions"),
             ("crypto", "Display active cryptographic suite descriptor"),
             ("crypto <hash> <cipher>", "Hot-swap crypto suite (e.g. 'crypto blake2b chacha20', 'crypto sha256 aes-gcm')"),
@@ -266,7 +289,8 @@ class PeerNodeCLI:
         status_txt = c("🛑 REVOKED ON-CHAIN", Colors.RED + Colors.BOLD) if is_revoked else c("✅ ACTIVE (ON-CHAIN)", Colors.GREEN + Colors.BOLD)
         print(f"  • Status         : {status_txt}")
         print(f"  • Crypto Suite   : {self.node.crypto_suite.get_descriptor()}")
-        print(f"  • Relay Endpoint : {self.relay_host}:{self.relay_port}")
+        print(f"  • Direct Listener: {self.node.listen_host}:{self.node.listen_port}")
+        print(f"  • Discovery      : {'connected' if self.node._relay_writer else 'unavailable / disabled'}")
         print(f"  • Active Channel : {self.node.active_channel}")
         print(f"  • Joined Channels: {', '.join(sorted(self.node.joined_channels))}")
         print(f"  • Connected Peers: {len(self.node.connected_peers)}")
@@ -278,7 +302,7 @@ class PeerNodeCLI:
         peers = list(self.node.connected_peers)
         print(c(f"\n👥 Connected Peers ({len(peers)}):", Colors.CYAN + Colors.BOLD))
         if not peers:
-            print("  No other peers connected to relay.")
+            print("  No direct peer connections yet.")
         else:
             for idx, p in enumerate(peers, 1):
                 is_rev = p in self.node.revoked_peers
@@ -347,10 +371,71 @@ class PeerNodeCLI:
             for tx in txs:
                 t_type = tx.get("type")
                 sender = tx.get("senderPeerId", "")[:16]
-                payload_str = json.dumps(tx.get("payload", {}))
-                print(f"  │    - [{c(t_type, Colors.YELLOW)}] Sender: {sender}... | {payload_str}")
+                payload = tx.get("payload", {})
+                if t_type == "DATA" and isinstance(payload, dict) and payload.get("action") == "MESSAGE_RECEIPT":
+                    recip = str(payload.get("recipientPeerId") or payload.get("target") or "")[:16]
+                    m_hash = str(payload.get("messageHash", ""))[:18]
+                    m_type = payload.get("msgType", "DM")
+                    print(f"  │    - [{c(f'RECEIPT:{m_type}', Colors.GREEN + Colors.BOLD)}] From: {sender}... ➔ Target: {recip}... | Hash: {m_hash}...")
+                else:
+                    payload_str = json.dumps(payload)
+                    print(f"  │    - [{c(t_type, Colors.YELLOW)}] Sender: {sender}... | {payload_str}")
             print(c("  └────────────────────────────────────────────────────────", Colors.CYAN))
         print()
+
+    async def show_message_receipts(self):
+        receipts = self.node.blockchain.get_message_receipts()
+        print(c(f"\n📜 On-Chain Message Receipts & Audit Trail ({len(receipts)} anchored):", Colors.CYAN + Colors.BOLD))
+        if not receipts:
+            print("  No message receipts anchored on blockchain yet.")
+            print(c("  💡 Tip: All messages (DMs, Channels, Broadcasts) are automatically anchored on-chain.\n", Colors.DIM))
+            return
+
+        print("  " + "-" * 98)
+        print(f"  {'Block':<7} {'Time':<10} {'Type':<10} {'Sender':<18} {'Target':<18} {'Message Hash':<24}")
+        print("  " + "-" * 98)
+        for r in receipts:
+            dt_str = datetime.fromtimestamp(r["timestamp"] / 1000).strftime("%H:%M:%S") if r.get("timestamp") else "N/A"
+            m_type = r.get("msgType", "DM")
+            s = r["sender"][:15] + "..." if len(r["sender"]) > 16 else r["sender"]
+            rec = str(r.get("target") or r.get("recipient", ""))
+            rec_str = rec[:15] + "..." if len(rec) > 16 else rec
+            mh = r["messageHash"][:21] + "..." if len(r["messageHash"]) > 22 else r["messageHash"]
+            print(f"  #{r['blockIndex']:<6} {dt_str:<10} {m_type:<10} {s:<18} {rec_str:<18} {mh:<24}")
+        print("  " + "-" * 98 + "\n")
+
+        # Interactive Verification Prompt
+        loop = asyncio.get_running_loop()
+        sys.stdout.write(c("Verify a message or hash against on-chain receipts? [y/N]: ", Colors.YELLOW))
+        sys.stdout.flush()
+        ans = (await loop.run_in_executor(None, sys.stdin.readline)).strip().lower()
+        if ans in ("y", "yes"):
+            sys.stdout.write("Enter message hash or plaintext message text to verify: ")
+            sys.stdout.flush()
+            query = (await loop.run_in_executor(None, sys.stdin.readline)).strip()
+            if query:
+                # 1. Direct match on messageHash or txHash
+                match = self.node.blockchain.verify_message_receipt(query)
+                # 2. Check if query is plaintext matching any recorded local message
+                if not match:
+                    for m in self.node.message_history:
+                        if m.get("text") == query and m.get("messageHash"):
+                            match = self.node.blockchain.verify_message_receipt(m["messageHash"])
+                            break
+                if match:
+                    print(c(f"\n✅ CRYPTOGRAPHICALLY VERIFIED ON-CHAIN!", Colors.GREEN + Colors.BOLD))
+                    print(f"  • Block Index  : #{match['blockIndex']}")
+                    print(f"  • Block Hash   : {match['blockHash']}")
+                    print(f"  • Tx Hash      : {match['txHash']}")
+                    print(f"  • Type         : {match.get('msgType', 'DM')}")
+                    print(f"  • Sender       : {match['sender']}")
+                    print(f"  • Target       : {match.get('target') or match.get('recipient')}")
+                    print(f"  • Message Hash : {match['messageHash']}")
+                    dt_str = datetime.fromtimestamp(match["timestamp"] / 1000).strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"  • Anchored At  : {dt_str}")
+                    print(c("  🛡️  Non-repudiation confirmed: Cryptographic proof immutable on-chain.\n", Colors.CYAN))
+                else:
+                    print(c(f"\n❌ Not Found: No matching on-chain receipt found on the blockchain.\n", Colors.RED))
 
     async def lookup_peer(self, query: str):
         if not query:
@@ -418,9 +503,9 @@ class PeerNodeCLI:
             print(c("\n┌────────────────────────────────────────────────────────┐", Colors.CYAN))
             print(c("│           SOVEREIGN P2P NODE - FUNCTION MENU           │", Colors.CYAN + Colors.BOLD))
             print(c("├────────────────────────────────────────────────────────┤", Colors.CYAN))
-            print("│  [1]  Send Confidential 1-on-1 Direct Message (ECIES)  │")
-            print("│  [2]  Send Group Channel Message (Symmetric AEAD)      │")
-            print("│  [3]  Send Signed Public Broadcast                     │")
+            print("│  [1]  Send Direct Message (ECIES, Auto-Anchored)       │")
+            print("│  [2]  Send Group Channel Message (AEAD, Auto-Anchored) │")
+            print("│  [3]  Send Signed Public Broadcast (Auto-Anchored)     │")
             print("│  [4]  Channel Management (Join / Leave / Switch)       │")
             print("│  [5]  DPKI: Revoke Active Key On-Chain                 │")
             print("│  [6]  DPKI: Reinstate / Unrevoke Key                   │")
@@ -431,10 +516,11 @@ class PeerNodeCLI:
             print("│  [11] View Trust Matrix & Connected Peers              │")
             print("│  [12] View Scoped Gossip & Cache Metrics               │")
             print("│  [13] Node Status Dashboard                            │")
+            print("│  [14] Audit On-Chain Message Receipts (Proof-of-Delivery)│")
             print("│  [0]  Return to CLI                                    │")
             print(c("└────────────────────────────────────────────────────────┘", Colors.CYAN))
 
-            sys.stdout.write(c("Select option [0-13]: ", Colors.YELLOW + Colors.BOLD))
+            sys.stdout.write(c("Select option [0-14]: ", Colors.YELLOW + Colors.BOLD))
             sys.stdout.flush()
             loop = asyncio.get_running_loop()
             line = await loop.run_in_executor(None, sys.stdin.readline)
@@ -463,7 +549,12 @@ class PeerNodeCLI:
                 if msg:
                     res = await self.node.send_direct_message(matched, msg)
                     if res.get("success"):
-                        print(c(f"✅ Confidential message encrypted with {self.node.crypto_suite.cipher_provider.name} and sent!", Colors.GREEN))
+                        if res.get("receipt"):
+                            b_idx = res["receipt"].get("blockIndex")
+                            m_h = res["receipt"].get("messageHash", "")[:18]
+                            print(c(f"✅ Delivered & Anchored in Block #{b_idx}! Receipt Hash: {m_h}...", Colors.GREEN + Colors.BOLD))
+                        else:
+                            print(c(f"✅ Confidential message encrypted with {self.node.crypto_suite.cipher_provider.name} and sent!", Colors.GREEN))
                     else:
                         print(c(f"❌ Failed: {res.get('error')}", Colors.RED))
 
@@ -479,7 +570,12 @@ class PeerNodeCLI:
                 if msg:
                     res = await self.node.send_channel_message(target_ch, msg)
                     if res.get("success"):
-                        print(c(f"✅ Encrypted channel message dispatched to {target_ch}!", Colors.GREEN))
+                        if res.get("receipt"):
+                            b_idx = res["receipt"].get("blockIndex")
+                            m_h = res["receipt"].get("messageHash", "")[:18]
+                            print(c(f"✅ Delivered & Anchored in Block #{b_idx}! Receipt Hash: {m_h}...", Colors.GREEN + Colors.BOLD))
+                        else:
+                            print(c(f"✅ Encrypted channel message dispatched to {target_ch}!", Colors.GREEN))
                     else:
                         print(c(f"❌ Failed: {res.get('error')}", Colors.RED))
 
@@ -490,7 +586,12 @@ class PeerNodeCLI:
                 if msg:
                     result = await self.node.send_broadcast(msg)
                     if result.get("success"):
-                        print(c("✅ Signed broadcast dispatched to all peers!", Colors.GREEN))
+                        if result.get("receipt"):
+                            b_idx = result["receipt"].get("blockIndex")
+                            m_h = result["receipt"].get("messageHash", "")[:18]
+                            print(c(f"✅ Delivered & Anchored in Block #{b_idx}! Receipt Hash: {m_h}...", Colors.GREEN + Colors.BOLD))
+                        else:
+                            print(c("✅ Signed broadcast dispatched to all peers!", Colors.GREEN))
                     else:
                         print(c(f"❌ Failed: {result.get('error')}", Colors.RED))
 
@@ -595,6 +696,9 @@ class PeerNodeCLI:
             elif choice == "13":
                 self.show_status()
 
+            elif choice == "14":
+                await self.show_message_receipts()
+
     # ──────────────────────────────────────────────────────────────
     # Main CLI Loop
     # ──────────────────────────────────────────────────────────────
@@ -645,6 +749,48 @@ class PeerNodeCLI:
                 # 7. Blockchain Explorer
                 if cmd in ("chain", "blocks"):
                     self.show_blockchain_explorer()
+                    continue
+
+                # 7b. Message Receipts & Audit Trail
+                if cmd in ("receipts", "audit"):
+                    await self.show_message_receipts()
+                    continue
+
+                if cmd.startswith("verify-receipt"):
+                    parts = cmd.split(maxsplit=1)
+                    q = parts[1].strip() if len(parts) > 1 else ""
+                    if not q:
+                        print(c("Usage: verify-receipt <message_hash_or_text>", Colors.RED))
+                    else:
+                        match = self.node.blockchain.verify_message_receipt(q)
+                        if not match:
+                            for m in self.node.message_history:
+                                if m.get("text") == q and m.get("messageHash"):
+                                    match = self.node.blockchain.verify_message_receipt(m["messageHash"])
+                                    break
+                        if match:
+                            dt_str = datetime.fromtimestamp(match["timestamp"] / 1000).strftime("%Y-%m-%d %H:%M:%S")
+                            m_type = match.get("msgType", "DM")
+                            target = match.get("target") or match.get("recipient")
+                            print(c(f"✅ Verified On-Chain! Block #{match['blockIndex']} [{m_type}] | From: {match['sender'][:16]}... | Target: {str(target)[:16]}... | Time: {dt_str}", Colors.GREEN + Colors.BOLD))
+                        else:
+                            print(c("❌ No matching receipt found on-chain.", Colors.RED))
+                    continue
+
+                if cmd.startswith("anchor-dm "):
+                    parts = cmd.split(maxsplit=2)
+                    if len(parts) < 3:
+                        print(c("Usage: anchor-dm <peerId_or_prefix> <message>", Colors.RED))
+                    else:
+                        target = parts[1]
+                        text = parts[2]
+                        matched = next((p for p in self.node.connected_peers if p.startswith(target)), target)
+                        res = await self.node.send_direct_message(matched, text, anchor_on_chain=True)
+                        if res.get("success"):
+                            b_idx = res.get("receipt", {}).get("blockIndex")
+                            print(c(f"✅ Anchored & sent in Block #{b_idx}!", Colors.GREEN + Colors.BOLD))
+                        else:
+                            print(c(f"❌ Error: {res.get('error')}", Colors.RED))
                     continue
 
                 # 8. Clear
@@ -750,7 +896,9 @@ class PeerNodeCLI:
                     msg = cmd.split(maxsplit=1)[1].strip()
                     result = await self.node.send_broadcast(msg)
                     if result.get("success"):
-                        print(c("📤 Broadcast dispatched!", Colors.BLUE))
+                        b_idx = result.get("receipt", {}).get("blockIndex")
+                        h_txt = f" [⛓️ Block #{b_idx}]" if b_idx is not None else ""
+                        print(c(f"📤 Broadcast dispatched!{h_txt}", Colors.BLUE))
                     else:
                         print(c(f"❌ Failed: {result.get('error')}", Colors.RED))
                     continue
@@ -775,7 +923,9 @@ class PeerNodeCLI:
                     res = await self.node.send_direct_message(matched, text)
                     if res.get("success"):
                         ts = datetime.now().strftime("%H:%M:%S")
-                        print(f"{c(f'[{ts}] 🔒 [YOU ➔ @{matched[:16]}... (ECIES)]', Colors.GREEN + Colors.BOLD)} {c(text, Colors.WHITE)}")
+                        b_idx = res.get("receipt", {}).get("blockIndex")
+                        h_txt = f" [⛓️ Block #{b_idx}]" if b_idx is not None else ""
+                        print(f"{c(f'[{ts}] 🔒 [YOU ➔ @{matched[:16]}... (ECIES){h_txt}]', Colors.GREEN + Colors.BOLD)} {c(text, Colors.WHITE)}")
                     else:
                         print(c(f"❌ DM failed: {res.get('error')}", Colors.RED))
                     continue
@@ -796,10 +946,12 @@ class PeerNodeCLI:
                     res = await self.node.send_channel_message(ch, text)
                     if res.get("success"):
                         ts = datetime.now().strftime("%H:%M:%S")
+                        b_idx = res.get("receipt", {}).get("blockIndex")
+                        h_txt = f" [⛓️ Block #{b_idx}]" if b_idx is not None else ""
                         peer_count = len(self.node.connected_peers)
-                        print(f"{c(f'[{ts}] 📢 [YOU ➔ {ch}]', Colors.CYAN + Colors.BOLD)} {c(text, Colors.WHITE)}")
+                        print(f"{c(f'[{ts}] 📢 [YOU ➔ {ch}{h_txt}]', Colors.CYAN + Colors.BOLD)} {c(text, Colors.WHITE)}")
                         if peer_count == 0:
-                            print(c(f"  ⚠️ (Notice: 0 other peers currently connected to relay)", Colors.YELLOW + Colors.DIM))
+                            print(c("  ⚠️ No direct peer connections yet.", Colors.YELLOW + Colors.DIM))
                     else:
                         print(c(f"❌ Failed: {res.get('error')}", Colors.RED))
                     continue
@@ -809,10 +961,12 @@ class PeerNodeCLI:
                 if res.get("success"):
                     ts = datetime.now().strftime("%H:%M:%S")
                     ch = self.node.active_channel
+                    b_idx = res.get("receipt", {}).get("blockIndex")
+                    h_txt = f" [⛓️ Block #{b_idx}]" if b_idx is not None else ""
                     peer_count = len(self.node.connected_peers)
-                    print(f"{c(f'[{ts}] 📢 [YOU ➔ {ch}]', Colors.CYAN + Colors.BOLD)} {c(cmd, Colors.WHITE)}")
+                    print(f"{c(f'[{ts}] 📢 [YOU ➔ {ch}{h_txt}]', Colors.CYAN + Colors.BOLD)} {c(cmd, Colors.WHITE)}")
                     if peer_count == 0:
-                        print(c(f"  ⚠️ (Notice: 0 other peers currently connected to relay)", Colors.YELLOW + Colors.DIM))
+                        print(c("  ⚠️ No direct peer connections yet.", Colors.YELLOW + Colors.DIM))
                 else:
                     print(c(f"❌ Failed: {res.get('error')}", Colors.RED))
 
@@ -825,13 +979,17 @@ class PeerNodeCLI:
         self._running = True
         self.print_banner()
 
-        # Connect node to relay and register on chain
-        print(c("🔗 Initializing sovereign node and connecting to relay...", Colors.CYAN))
+        print(c("🔗 Starting direct peer listener and local identity...", Colors.CYAN))
         connected = await self.node.start()
         if not connected:
-            print(c(f"⚠️ Could not reach relay at {self.relay_host}:{self.relay_port}. Running in standalone offline mode.", Colors.YELLOW))
+            print(c("❌ Could not start the peer listener. Check its address and port.", Colors.RED))
+            return
         else:
-            print(c(f"✅ Connected to relay at {self.relay_host}:{self.relay_port}!", Colors.GREEN))
+            print(c(f"✅ Peer listening on {self.node.listen_host}:{self.node.listen_port}.", Colors.GREEN))
+            if self.relay_host:
+                print(c(f"Discovery bootstrap: {self.relay_host}:{self.relay_port} (optional after discovery).", Colors.CYAN))
+            else:
+                print(c("Bootstrap disabled; discovering through supplied peer addresses.", Colors.CYAN))
 
         try:
             await self.cli_loop()
@@ -847,7 +1005,13 @@ class PeerNodeCLI:
 def main():
     parser = argparse.ArgumentParser(description="P2P Sovereign Node CLI (Pure Terminal, Zero UI)")
     parser.add_argument("--relay", default=os.environ.get("RELAY_ADDR", "127.0.0.1:4001"),
-                        help="Relay host:port (e.g. 127.0.0.1:4001 or 192.168.1.100:4001)")
+                        help="Discovery server host:port (default: 127.0.0.1:4001)")
+    parser.add_argument("--no-relay", action="store_true", help="Use direct peer discovery only")
+    parser.add_argument("--listen-host", default="0.0.0.0", help="Direct TCP bind address")
+    parser.add_argument("--listen-port", type=int, default=0, help="Direct TCP port (0 chooses a free port)")
+    parser.add_argument("--advertise-host", help="LAN IP other peers should connect to")
+    parser.add_argument("--peer", action="append", default=[], metavar="HOST:PORT",
+                        help="Existing peer's direct address; repeat for additional seeds")
     parser.add_argument("--port", type=int, default=None,
                         help="Port identifier for peer identity file (e.g. 8501 -> peer_identity_8501.json)")
     parser.add_argument("--id-file", default=None,
@@ -858,8 +1022,22 @@ def main():
                         help="Initial active channel (default: #general)")
     args = parser.parse_args()
 
-    relay_host, relay_port = args.relay.split(":") if ":" in args.relay else (args.relay, 4001)
-    relay_port = int(relay_port)
+    def endpoint(value):
+        try:
+            host, port = value.rsplit(":", 1)
+            port = int(port)
+            if not host or not 1 <= port <= 65535:
+                raise ValueError
+            return host, port
+        except ValueError:
+            parser.error(f"Expected HOST:PORT with a port from 1 to 65535: {value}")
+
+    if not 0 <= args.listen_port <= 65535:
+        parser.error("--listen-port must be between 0 and 65535")
+    relay_host, relay_port = endpoint(args.relay if ":" in args.relay else args.relay + ":4001")
+    if args.no_relay:
+        relay_host = None
+    seed_peers = [endpoint(value) for value in args.peer]
 
     # Determine identity file
     identity_file = args.id_file
@@ -873,7 +1051,11 @@ def main():
         relay_port=relay_port,
         identity_file=identity_file,
         peer_id=args.peer_id,
-        initial_channel=args.channel
+        initial_channel=args.channel,
+        listen_host=args.listen_host,
+        listen_port=args.listen_port,
+        advertise_host=args.advertise_host,
+        seed_peers=seed_peers,
     )
 
     try:

@@ -246,7 +246,7 @@ class ThreeNodeNetworkRegressions(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["success"])
         self.assertIn(self.alice.peer_id, self.charlie.revoked_peers)
 
-    async def test_incoming_verification_does_not_block_relay_responses(self):
+    async def test_incoming_verification_does_not_block_direct_responses(self):
         self.bob.revocation_cache.clear()
         received = asyncio.Event()
         self.bob.on_message_received = lambda message: received.set()
@@ -256,17 +256,23 @@ class ThreeNodeNetworkRegressions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bob.message_history[-1]["text"], "Verified by a live receiver")
         self.assertGreater(self.bob.metrics.get("chain_syncs_on_demand", 0), 0)
 
-    async def test_relay_reconnect_rebuilds_memberships_and_clears_cache(self):
+    async def test_bootstrap_reconnect_preserves_direct_connections_and_cache(self):
         await self.charlie.verify_peer_revocation_lazy(self.alice.peer_id)
+        cache_before = dict(self.charlie.revocation_cache)
+        writers_before = dict(self.charlie._peer_writers)
+        memberships_before = {ch: set(peers) for ch, peers in self.charlie.channel_members.items()}
         events = []
         self.charlie.on_peer_event = lambda event, pid: events.append(event)
         relay.active_peers[self.charlie.peer_id].close()
         await wait_until(lambda: "RELAY_DISCONNECTED" in events)
-        self.assertFalse(self.charlie.revocation_cache)
+        self.assertEqual(self.charlie.revocation_cache, cache_before)
+        self.assertEqual(self.charlie._peer_writers, writers_before)
+        self.assertEqual(self.charlie.channel_members, memberships_before)
         await wait_until(lambda: "RELAY_CONNECTED" in events)
         await wait_until(lambda: len(self.charlie.connected_peers) == 2)
         result = await self.charlie.verify_peer_revocation_lazy(self.alice.peer_id)
         self.assertTrue(result["verified"], result)
+        self.assertNotIn("PEER_LEFT", events)
 
 
 if __name__ == "__main__":

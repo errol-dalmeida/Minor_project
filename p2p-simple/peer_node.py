@@ -20,6 +20,8 @@ from crypto_modular import CryptoSuite, SHA256Provider, NISTP256Provider, AESGCM
 from crypto import create_did
 from blockchain import NativeBlockchain, Transaction, TransactionType, RevocationReason
 
+MAX_FRAME_BYTES = 4 * 1024 * 1024
+
 
 class PeerNode:
     """
@@ -29,14 +31,26 @@ class PeerNode:
     def __init__(
         self,
         peer_id: Optional[str] = None,
-        relay_host: str = "127.0.0.1",
+        relay_host: Optional[str] = "127.0.0.1",
         relay_port: int = 4001,
+        listen_host: str = "0.0.0.0",
+        listen_port: int = 0,
         crypto_suite: Optional[CryptoSuite] = None,
         auto_register_blockchain: bool = True,
-        identity_file: Optional[str] = None
+        identity_file: Optional[str] = None,
+        advertise_host: Optional[str] = None,
+        seed_peers: Optional[List[tuple]] = None,
     ):
         self.relay_host = relay_host
         self.relay_port = relay_port
+        # Direct P2P listening address (0 = OS assigns a free port)
+        self.listen_host = listen_host
+        self.listen_port = listen_port          # actual port filled in after start()
+        self.advertise_host = advertise_host
+        self._advertise_host = advertise_host or (
+            listen_host if listen_host not in ("0.0.0.0", "::") else None
+        )
+        self.seed_peers = list(seed_peers or [])
         self.crypto_suite = crypto_suite or CryptoSuite.default()
         self.identity_file = identity_file
 
@@ -108,6 +122,20 @@ class PeerNode:
         self._is_running = False
         self.auto_register_blockchain = auto_register_blockchain
 
+        # ── Direct P2P mesh (Solution 2) ──────────────────────────
+        # peer_id -> asyncio.StreamWriter for the direct socket to that peer
+        self._peer_writers: Dict[str, asyncio.StreamWriter] = {}
+        # peer_id -> (host, port) of that peer's direct listener
+        self._peer_addresses: Dict[str, tuple] = {}
+        self._peer_connection_ids: Dict[str, tuple] = {}
+        self._dial_locks: Dict[Any, asyncio.Lock] = {}
+        self._retry_at: Dict[Any, float] = {}
+        self._retry_delay: Dict[Any, float] = {}
+        self.heartbeat_interval = 5.0
+        self.peer_timeout = 20.0
+        # Our own inbound P2P listener server
+        self._p2p_server: Optional[asyncio.AbstractServer] = None
+
         self._setup_blockchain_listeners()
 
     def get_channel_key(self, channel: str) -> str:
@@ -157,12 +185,22 @@ class PeerNode:
             if self.on_blockchain_event:
                 self.on_blockchain_event("onBlockAdded", b_dict)
 
+        def on_message_receipt(data):
+            s = str(data.get("sender", ""))
+            r = str(data.get("recipient", ""))
+            mh = str(data.get("messageHash", ""))
+            log_msg = f"📜 [BLOCKCHAIN] Message receipt anchored: {s[:16]}... ➔ {r[:16]}... (Hash: {mh[:16]}...)"
+            self._log_event(log_msg)
+            if self.on_blockchain_event:
+                self.on_blockchain_event("onMessageReceipt", data)
+
         self.blockchain.subscribe_events({
             "onKeyRevoked": on_revoked,
             "onKeyUnrevoked": on_unrevoked,
             "onKeyRotated": on_rotated,
             "onKeyRegistered": on_registered,
-            "onBlockAdded": on_block_added
+            "onBlockAdded": on_block_added,
+            "onMessageReceipt": on_message_receipt
         })
 
     def _log_event(self, text: str):
@@ -179,7 +217,7 @@ class PeerNode:
     # ─────────────────────────────────────────────────────────────
 
     async def start(self) -> bool:
-        """Initialize blockchain identity and connect to relay."""
+        """Start an independent peer; bootstrap discovery is optional."""
         self._is_running = True
 
         if self.auto_register_blockchain:
@@ -192,25 +230,38 @@ class PeerNode:
                 self._log_event(f"Identity registered on local chain in Block #{b.index}")
 
         try:
-            reader, writer = await asyncio.open_connection(self.relay_host, self.relay_port)
-            self._relay_reader = reader
-            self._relay_writer = writer
-
-            # Handshake
-            handshake = {"type": "REGISTER_PEER", "peerId": self.peer_id}
-            writer.write((json.dumps(handshake) + "\n").encode("utf-8"))
-            await writer.drain()
-
-            self._listener_task = asyncio.create_task(self._relay_listener(reader))
-            self._log_event(f"Connected to P2P relay at {self.relay_host}:{self.relay_port}")
-            return True
+            self._p2p_server = await asyncio.start_server(
+                self._handle_inbound_peer, self.listen_host, self.listen_port,
+                limit=MAX_FRAME_BYTES,
+            )
+            sock = self._p2p_server.sockets[0]
+            self.listen_port = sock.getsockname()[1]
         except Exception as e:
-            self._log_event(f"Relay connection unavailable: {e}. Running standalone.")
+            self._is_running = False
+            self._log_event(f"Could not start direct peer listener: {e}")
             return False
+        self._log_event(f"Direct P2P listener running on {self.listen_host}:{self.listen_port}")
+        self._start_background_task(self._maintain_peer_connections())
+        if self.relay_host:
+            self._listener_task = self._start_background_task(self._bootstrap_loop())
+        return True
+
+    def _listen_address(self, writer: Optional[asyncio.StreamWriter] = None) -> dict:
+        """Use the actual LAN connection's interface, never an Internet probe."""
+        host = self._advertise_host
+        if writer and not self.advertise_host and self.listen_host in ("0.0.0.0", "::"):
+            local = writer.get_extra_info("sockname")
+            if local:
+                host = local[0]
+                self._advertise_host = host
+        return {"peerId": self.peer_id, "listenHost": host or "127.0.0.1",
+                "listenPort": self.listen_port}
 
     async def stop(self):
-        """Cleanly disconnect from relay."""
+        """Cleanly disconnect from relay and close all direct peer connections."""
         self._is_running = False
+        if self._p2p_server:
+            self._p2p_server.close()
         tasks = set(self._background_tasks)
         if self._listener_task:
             tasks.add(self._listener_task)
@@ -222,6 +273,26 @@ class PeerNode:
             if not future.done():
                 future.set_result(False)
         self._pending_chain_syncs.clear()
+
+        # Close all direct peer connections
+        for pid, w in list(self._peer_writers.items()):
+            try:
+                w.close()
+                await w.wait_closed()
+            except Exception:
+                pass
+        self._peer_writers.clear()
+        self._peer_connection_ids.clear()
+        self.connected_peers.clear()
+
+        if self._p2p_server:
+            self._p2p_server.close()
+            try:
+                await self._p2p_server.wait_closed()
+            except Exception:
+                pass
+            self._p2p_server = None
+
         if self._relay_writer:
             try:
                 self._relay_writer.close()
@@ -297,9 +368,9 @@ class PeerNode:
 
         self.metrics["cache_misses"] += 1
 
-        # The relay listener remains free to process this response while
-        # incoming chat messages are verified in background tasks.
-        if self._relay_writer and peer_id in self.connected_peers:
+        # Running peers must obtain a direct reply before calling a cache
+        # refresh verified. Offline/in-process ledger use remains supported.
+        if self._is_running and peer_id != self.peer_id:
             if not await self._sync_chain_with_peer(peer_id):
                 self.revocation_cache.pop(peer_id, None)
                 self._log_event(f"⚠️ Lazy verification unavailable for {peer_id[:16]}... (chain refresh failed).")
@@ -402,15 +473,16 @@ class PeerNode:
             if not future.done():
                 future.set_result(False)
 
-    async def send_direct_message(self, recipient_id: str, message_text: str) -> Dict[str, Any]:
-        """Send confidential 1-on-1 ECIES encrypted DM with on-demand lazy check."""
+    async def send_direct_message(self, recipient_id: str, message_text: str, anchor_on_chain: bool = True) -> Dict[str, Any]:
+        """Send confidential 1-on-1 ECIES encrypted DM with on-demand lazy check and automatic on-chain receipt anchoring."""
         if self.peer_id in self.revoked_peers:
             err = "Cannot send DM: Your local identity is REVOKED on-chain."
             self._log_event(f"🚫 {err}")
             return {"success": False, "error": err}
 
-        if not self._relay_writer or recipient_id not in self.connected_peers:
-            return {"success": False, "error": "Recipient is not connected to the relay."}
+        reachable = recipient_id in self.connected_peers
+        if not reachable:
+            return {"success": False, "error": "Recipient is unreachable (not connected)."}
 
         # 1. On-Demand Lazy Revocation Check
         lazy_check = await self.verify_peer_revocation_lazy(
@@ -444,22 +516,43 @@ class PeerNode:
         sig_payload = f"{encrypted_data['ciphertext']}:{encrypted_data['iv']}:{encrypted_data['tag']}:{timestamp}"
         signature = self.crypto_suite.sign(sig_payload, self.private_key)
 
+        receipt_info = None
+        if anchor_on_chain:
+            message_hash = self.crypto_suite.hash(sig_payload)
+            receipt_res = await self.blockchain.commit_message_receipt(
+                self.peer_id, recipient_id, message_hash, self.private_key, msg_type="DM"
+            )
+            if receipt_res.get("success"):
+                await self._send_scoped_transaction(receipt_res["transaction"])
+                b = receipt_res.get("block")
+                receipt_info = {
+                    "messageHash": message_hash,
+                    "blockIndex": b.index if b else None,
+                    "txHash": receipt_res.get("txHash"),
+                    "target": recipient_id,
+                    "msgType": "DM"
+                }
+                self._log_event(f"📜 DM receipt anchored to Block #{receipt_info['blockIndex']} (Hash: {message_hash[:16]}...)")
+
         payload = {
             "from": self.peer_id,
             "to": recipient_id,
             "encryptedData": encrypted_data,
             "signature": signature,
-            "timestamp": timestamp
+            "timestamp": timestamp,
+            "receipt": receipt_info
         }
 
         if not await self._send_routed("/chat/dm/1.0.0", recipient_id, payload):
-            return {"success": False, "error": "Relay unavailable; DM was not sent."}
-        self._record_message("OUTGOING_DM", self.peer_id, recipient_id, message_text, "1-on-1 E2EE")
+            return {"success": False, "error": "Direct peer connection unavailable; DM was not sent."}
+        msg_hash = self.crypto_suite.hash(sig_payload)
+        self._record_message("OUTGOING_DM", self.peer_id, recipient_id, message_text, "1-on-1 E2EE",
+                             receipt=receipt_info, message_hash=msg_hash)
         self._log_event(f"🔒 Sent ECIES DM to {recipient_id[:16]}...: \"{message_text}\"")
-        return {"success": True, "payload": payload}
+        return {"success": True, "payload": payload, "receipt": receipt_info}
 
-    async def send_channel_message(self, channel: str, message_text: str) -> Dict[str, Any]:
-        """Send encrypted message to group channel."""
+    async def send_channel_message(self, channel: str, message_text: str, anchor_on_chain: bool = True) -> Dict[str, Any]:
+        """Send encrypted message to group channel with automatic on-chain receipt anchoring."""
         if self.peer_id in self.revoked_peers:
             return {"success": False, "error": "Cannot send channel message: Your identity is REVOKED."}
         if channel not in self.joined_channels:
@@ -476,31 +569,81 @@ class PeerNode:
         sig_payload = f"{channel}:{encrypted_data['ciphertext']}:{encrypted_data['iv']}:{encrypted_data['tag']}:{timestamp}"
         signature = self.crypto_suite.sign(sig_payload, self.private_key)
 
+        receipt_info = None
+        if anchor_on_chain:
+            message_hash = self.crypto_suite.hash(sig_payload)
+            receipt_res = await self.blockchain.commit_message_receipt(
+                self.peer_id, channel, message_hash, self.private_key, msg_type="CHANNEL"
+            )
+            if receipt_res.get("success"):
+                await self._send_scoped_transaction(receipt_res["transaction"])
+                b = receipt_res.get("block")
+                receipt_info = {
+                    "messageHash": message_hash,
+                    "blockIndex": b.index if b else None,
+                    "txHash": receipt_res.get("txHash"),
+                    "target": channel,
+                    "msgType": "CHANNEL"
+                }
+                self._log_event(f"📜 Channel message receipt anchored to Block #{receipt_info['blockIndex']} (Hash: {message_hash[:16]}...)")
+
         payload = {
             "channel": channel,
             "from": self.peer_id,
             "encryptedData": encrypted_data,
             "signature": signature,
-            "timestamp": timestamp
+            "timestamp": timestamp,
+            "receipt": receipt_info
         }
 
         if not await self._send_routed("/chat/channel/1.0.0", "*", payload):
-            return {"success": False, "error": "Relay unavailable; channel message was not sent."}
-        self._record_message("OUTGOING_CHANNEL", self.peer_id, channel, message_text, f"Channel {channel}")
+            return {"success": False, "error": "No direct peer connection; channel message was not sent."}
+        msg_hash = self.crypto_suite.hash(sig_payload)
+        self._record_message("OUTGOING_CHANNEL", self.peer_id, channel, message_text, f"Channel {channel}",
+                             receipt=receipt_info, message_hash=msg_hash)
         self._log_event(f"📢 Sent encrypted message to {channel}: \"{message_text}\"")
-        return {"success": True, "payload": payload}
+        return {"success": True, "payload": payload, "receipt": receipt_info}
 
-    async def send_broadcast(self, message_text: str) -> Dict[str, Any]:
-        """Send signed public broadcast message."""
+    async def send_broadcast(self, message_text: str, anchor_on_chain: bool = True) -> Dict[str, Any]:
+        """Send signed public broadcast message with automatic on-chain receipt anchoring."""
         if self.peer_id in self.revoked_peers:
             return {"success": False, "error": "Cannot broadcast: Your identity is REVOKED."}
         sig = self.crypto_suite.sign(message_text, self.private_key)
-        payload = {"from": self.peer_id, "message": message_text, "signature": sig}
+        timestamp = int(time.time() * 1000)
+        sig_payload = f"{message_text}:{sig}"
+
+        receipt_info = None
+        if anchor_on_chain:
+            message_hash = self.crypto_suite.hash(sig_payload)
+            receipt_res = await self.blockchain.commit_message_receipt(
+                self.peer_id, "*", message_hash, self.private_key, msg_type="BROADCAST"
+            )
+            if receipt_res.get("success"):
+                await self._send_scoped_transaction(receipt_res["transaction"])
+                b = receipt_res.get("block")
+                receipt_info = {
+                    "messageHash": message_hash,
+                    "blockIndex": b.index if b else None,
+                    "txHash": receipt_res.get("txHash"),
+                    "target": "*",
+                    "msgType": "BROADCAST"
+                }
+                self._log_event(f"📜 Broadcast receipt anchored to Block #{receipt_info['blockIndex']} (Hash: {message_hash[:16]}...)")
+
+        payload = {
+            "from": self.peer_id,
+            "message": message_text,
+            "signature": sig,
+            "timestamp": timestamp,
+            "receipt": receipt_info
+        }
         if not await self._send_routed("/chat/1.0.0", "*", payload):
-            return {"success": False, "error": "Relay unavailable; broadcast was not sent."}
-        self._record_message("OUTGOING_BROADCAST", self.peer_id, "*", message_text, "Signed Broadcast")
+            return {"success": False, "error": "No direct peer connection; broadcast was not sent."}
+        msg_hash = self.crypto_suite.hash(sig_payload)
+        self._record_message("OUTGOING_BROADCAST", self.peer_id, "*", message_text, "Signed Broadcast",
+                             receipt=receipt_info, message_hash=msg_hash)
         self._log_event(f"📤 Broadcasted signed message: \"{message_text}\"")
-        return {"success": True}
+        return {"success": True, "payload": payload, "receipt": receipt_info}
 
     async def join_channel(self, channel: str):
         """Join or create a custom group channel."""
@@ -649,29 +792,243 @@ class PeerNode:
     # Internal Network & Protocol Streaming Handlers
     # ─────────────────────────────────────────────────────────────
 
-    async def _send_routed(self, protocol: str, target: str, data: dict) -> bool:
-        if not self._relay_writer or self._relay_writer.is_closing():
-            return False
+    def _make_envelope(self, protocol: str, target: str, data: dict) -> bytes:
+        """Serialise a protocol message to a newline-delimited JSON frame."""
         envelope = {
             "type": "ROUTED_MSG",
             "protocol": protocol,
             "sender": self.peer_id,
             "target": target,
-            "data": data
+            "data": data,
         }
+        return (json.dumps(envelope) + "\n").encode("utf-8")
+
+    async def _write_to_peer(self, writer: asyncio.StreamWriter, raw: bytes) -> bool:
         try:
-            line = json.dumps(envelope) + "\n"
-            self._relay_writer.write(line.encode("utf-8"))
-            await self._relay_writer.drain()
+            if writer.is_closing() or len(raw) > MAX_FRAME_BYTES:
+                return False
+            writer.write(raw)
+            await asyncio.wait_for(writer.drain(), timeout=3.0)
             return True
-        except Exception as exc:
-            self._log_event(f"Relay send failed: {exc}")
+        except (ConnectionError, OSError, asyncio.TimeoutError):
             return False
+
+    async def _send_routed(self, protocol: str, target: str, data: dict) -> bool:
+        """Send directly to the recipient(s). The bootstrap never carries data."""
+        raw = self._make_envelope(protocol, target, data)
+        recipients = list(self._peer_writers.items()) if target == "*" else [
+            (target, self._peer_writers.get(target))
+        ]
+        sent = False
+        for pid, writer in recipients:
+            if writer is None:
+                continue
+            if await self._write_to_peer(writer, raw):
+                sent = True
+            else:
+                self._drop_peer_connection(pid, writer)
+        return sent
 
     def _start_background_task(self, coroutine):
         task = asyncio.create_task(coroutine)
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+
+        def done(completed):
+            self._background_tasks.discard(completed)
+            if not completed.cancelled() and completed.exception():
+                self._log_event(f"Network task failed: {completed.exception()}")
+
+        task.add_done_callback(done)
+        return task
+
+    def _remember_peer_address(self, pid, host, port) -> bool:
+        if (not isinstance(pid, str) or not pid or len(pid) > 256 or pid == self.peer_id
+                or not isinstance(host, str) or not host or len(host) > 255
+                or host in ("0.0.0.0", "::") or type(port) is not int
+                or not 1 <= port <= 65535):
+            return False
+        address = (host, port)
+        if self._peer_addresses.get(pid) != address:
+            self._retry_at.pop(pid, None)
+            self._retry_delay.pop(pid, None)
+        self._peer_addresses[pid] = address
+        return True
+
+    def _discover_peer(self, entry):
+        if not isinstance(entry, dict):
+            return
+        pid, host, port = entry.get("peerId"), entry.get("listenHost"), entry.get("listenPort")
+        if self._remember_peer_address(pid, host, port) and pid not in self.connected_peers:
+            self._start_background_task(self._connect_to_peer(pid, host, port))
+
+    def _adopt_peer_connection(self, pid, writer, connection_id) -> bool:
+        old = self._peer_writers.get(pid)
+        # Both ends choose the same connection when they dial simultaneously.
+        if old and not old.is_closing():
+            if self._peer_connection_ids[pid] <= connection_id:
+                return False
+        first_connection = pid not in self.connected_peers
+        self._peer_writers[pid] = writer
+        self._peer_connection_ids[pid] = connection_id
+        self.connected_peers.add(pid)
+        self.revocation_cache.pop(pid, None)
+        self._retry_at.pop(pid, None)
+        self._retry_delay.pop(pid, None)
+        if old and old is not writer:
+            old.close()
+        if first_connection:
+            self._log_event(f"Direct P2P connection established with {pid[:16]}...")
+            if self.on_peer_event:
+                self.on_peer_event("PEER_JOINED", pid)
+            if self.on_peer_update:
+                self.on_peer_update()
+        return True
+
+    def _drop_peer_connection(self, pid, writer):
+        writer.close()
+        # A reader for an old connection must never remove its replacement.
+        if self._peer_writers.get(pid) is not writer:
+            return
+        self._peer_writers.pop(pid, None)
+        self._peer_connection_ids.pop(pid, None)
+        self.connected_peers.discard(pid)
+        self.revocation_cache.pop(pid, None)
+        for members in self.channel_members.values():
+            members.discard(pid)
+        pending = self._pending_chain_syncs.get(pid)
+        if pending and not pending[1].done():
+            pending[1].set_result(False)
+        self._retry_at[pid] = time.monotonic() + 0.2
+        self._log_event(f"Direct P2P connection closed with {pid[:16]}...")
+        if self.on_peer_event:
+            self.on_peer_event("PEER_LEFT", pid)
+        if self.on_peer_update:
+            self.on_peer_update()
+
+    async def _handle_inbound_peer(self, reader, writer):
+        task = asyncio.current_task()
+        self._background_tasks.add(task)
+        pid = None
+        try:
+            hello = json.loads(await asyncio.wait_for(reader.readline(), timeout=4.0))
+            pid = hello.get("peerId")
+            token = hello.get("connectionId")
+            if (hello.get("type") != "P2P_HELLO" or not isinstance(token, str)
+                    or not token or len(token) > 128
+                    or not self._remember_peer_address(
+                        pid, hello.get("listenHost"), hello.get("listenPort"))):
+                return
+            accepted = self._adopt_peer_connection(pid, writer, (pid, token))
+            reply = {"type": "P2P_HELLO_ACK", "connectionId": token,
+                     "accepted": accepted, **self._listen_address(writer)}
+            if not await self._write_to_peer(writer, (json.dumps(reply) + "\n").encode()):
+                return
+            if accepted:
+                self._start_background_task(self._on_peer_join(pid, writer))
+                await self._read_direct_peer(pid, reader, writer)
+        except (ValueError, AttributeError, ConnectionError, OSError, asyncio.TimeoutError):
+            pass
+        finally:
+            if isinstance(pid, str) and pid:
+                self._drop_peer_connection(pid, writer)
+            else:
+                writer.close()
+            self._background_tasks.discard(task)
+
+    async def _connect_to_peer(self, pid: Optional[str], host: str, port: int) -> bool:
+        if pid == self.peer_id or not self._is_running:
+            return False
+        key = pid or (host, port)
+        lock = self._dial_locks.setdefault(key, asyncio.Lock())
+        if lock.locked():
+            return pid in self.connected_peers
+        async with lock:
+            if pid in self.connected_peers:
+                return True
+            writer = None
+            adopted = False
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port, limit=MAX_FRAME_BYTES), timeout=4.0
+                )
+                token = uuid.uuid4().hex
+                hello = {"type": "P2P_HELLO", "connectionId": token,
+                         **self._listen_address(writer)}
+                if not await self._write_to_peer(writer, (json.dumps(hello) + "\n").encode()):
+                    return False
+                reply = json.loads(await asyncio.wait_for(reader.readline(), timeout=4.0))
+                remote_id = reply.get("peerId")
+                if (reply.get("type") != "P2P_HELLO_ACK" or reply.get("connectionId") != token
+                        or (pid is not None and remote_id != pid)
+                        or not self._remember_peer_address(
+                            remote_id, reply.get("listenHost"), reply.get("listenPort"))):
+                    return False
+                if not reply.get("accepted"):
+                    return remote_id in self.connected_peers
+                pid = remote_id
+                adopted = self._adopt_peer_connection(pid, writer, (self.peer_id, token))
+                if adopted:
+                    self._start_background_task(self._read_direct_peer(pid, reader, writer))
+                    self._start_background_task(self._on_peer_join(pid, writer))
+                return pid in self.connected_peers
+            except (ValueError, AttributeError, ConnectionError, OSError, asyncio.TimeoutError):
+                return False
+            finally:
+                if writer and not adopted:
+                    writer.close()
+                if not adopted:
+                    delay = min(self._retry_delay.get(key, 0.5) * 2, 30.0)
+                    self._retry_delay[key] = delay
+                    self._retry_at[key] = time.monotonic() + delay
+
+    async def _read_direct_peer(self, pid, reader, writer):
+        try:
+            while self._is_running and self._peer_writers.get(pid) is writer:
+                line = await asyncio.wait_for(reader.readline(), timeout=self.peer_timeout)
+                if not line:
+                    break
+                try:
+                    msg = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("type") == "P2P_PING":
+                    if not await self._write_to_peer(writer, b'{"type":"P2P_PONG"}\n'):
+                        break
+                    continue
+                if msg.get("type") == "P2P_PONG":
+                    continue
+                if (msg.get("type") != "ROUTED_MSG" or msg.get("sender") != pid
+                        or msg.get("target") not in (self.peer_id, "*")):
+                    continue
+                # Existing payload signatures and key lifecycle checks still
+                # apply. Bind the envelope sender to this connection's peer ID.
+                if str(msg.get("protocol", "")).startswith("/chat/"):
+                    self._start_background_task(self._handle_protocol_message(msg))
+                else:
+                    await self._handle_protocol_message(msg)
+        except (ValueError, ConnectionError, OSError, asyncio.TimeoutError):
+            pass
+        finally:
+            self._drop_peer_connection(pid, writer)
+
+    async def _maintain_peer_connections(self):
+        last_ping = time.monotonic()
+        while self._is_running:
+            for pid, (host, port) in list(self._peer_addresses.items()):
+                if pid not in self.connected_peers and time.monotonic() >= self._retry_at.get(pid, 0):
+                    self._start_background_task(self._connect_to_peer(pid, host, port))
+            live_addresses = {self._peer_addresses.get(pid) for pid in self.connected_peers}
+            for host, port in self.seed_peers:
+                if (host, port) not in live_addresses and time.monotonic() >= self._retry_at.get((host, port), 0):
+                    self._start_background_task(self._connect_to_peer(None, host, port))
+            if time.monotonic() - last_ping >= self.heartbeat_interval:
+                for pid, writer in list(self._peer_writers.items()):
+                    if not await self._write_to_peer(writer, b'{"type":"P2P_PING"}\n'):
+                        self._drop_peer_connection(pid, writer)
+                last_ping = time.monotonic()
+            await asyncio.sleep(0.5)
 
     async def _handle_protocol_message(self, msg: dict):
         try:
@@ -682,104 +1039,65 @@ class PeerNode:
     async def _broadcast_transaction(self, tx: Transaction):
         await self._send_routed("/chain/tx/1.0.0", "*", tx.to_dict())
 
-    async def _reconnect_relay(self) -> bool:
-        try:
-            reader, writer = await asyncio.open_connection(self.relay_host, self.relay_port)
-            self._relay_reader = reader
-            self._relay_writer = writer
-
-            handshake = {"type": "REGISTER_PEER", "peerId": self.peer_id}
-            writer.write((json.dumps(handshake) + "\n").encode("utf-8"))
-            await writer.drain()
-
-            self._listener_task = asyncio.create_task(self._relay_listener(reader))
-            self._log_event(f"Reconnected to P2P relay at {self.relay_host}:{self.relay_port}")
-            if self.on_peer_event:
-                self.on_peer_event("RELAY_CONNECTED", "")
-            if self.on_peer_update:
-                self.on_peer_update()
-            return True
-        except Exception:
-            return False
-
-    async def _relay_listener(self, reader: asyncio.StreamReader):
+    async def _bootstrap_loop(self):
+        """Refresh discovery independently of all established peer connections."""
+        unavailable_logged = False
         while self._is_running:
+            writer = None
+            registered = False
             try:
-                line = await reader.readline()
-            except asyncio.CancelledError:
-                break
-            except (ConnectionError, OSError, ValueError):
-                line = b""
-            if not line:
-                old_writer = self._relay_writer
-                self._relay_writer = None
-                self._relay_reader = None
-                if old_writer:
-                    old_writer.close()
-                self.connected_peers.clear()
-                self.revocation_cache.clear()
-                for members in self.channel_members.values():
-                    members.clear()
-                for _, future in self._pending_chain_syncs.values():
-                    if not future.done():
-                        future.set_result(False)
-                self._log_event("Relay connection dropped.")
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.relay_host, self.relay_port, limit=MAX_FRAME_BYTES),
+                    timeout=3.0,
+                )
+                self._relay_reader, self._relay_writer = reader, writer
+                registration = {"type": "REGISTER_PEER", **self._listen_address(writer)}
+                writer.write((json.dumps(registration) + "\n").encode())
+                await asyncio.wait_for(writer.drain(), timeout=3.0)
+                registered = True
+                unavailable_logged = False
+                self._log_event(f"Discovery connected at {self.relay_host}:{self.relay_port}")
                 if self.on_peer_event:
-                    self.on_peer_event("RELAY_DISCONNECTED", "")
-                if self.on_peer_update:
-                    self.on_peer_update()
-                while self._is_running:
-                    await asyncio.sleep(2.0)
-                    if await self._reconnect_relay():
-                        break
-                break
+                    self.on_peer_event("RELAY_CONNECTED", "")
+                await self._relay_listener(reader)
+            except (ValueError, ConnectionError, OSError, asyncio.TimeoutError):
+                if not unavailable_logged:
+                    self._log_event("Bootstrap unavailable; direct peer connections remain independent.")
+                    unavailable_logged = True
+            finally:
+                if self._relay_writer is writer:
+                    self._relay_reader = None
+                    self._relay_writer = None
+                if writer:
+                    writer.close()
+                if registered and self._is_running:
+                    self._log_event("Discovery disconnected; direct peer connections are unchanged.")
+                    if self.on_peer_event:
+                        self.on_peer_event("RELAY_DISCONNECTED", "")
+            await asyncio.sleep(2.0)
+
+    async def _relay_listener(self, reader):
+        while self._is_running:
+            line = await reader.readline()
+            if not line:
+                return
             try:
-                msg = json.loads(line.decode("utf-8").strip())
+                msg = json.loads(line)
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
             if not isinstance(msg, dict):
                 continue
+            if msg.get("type") == "PEER_LIST":
+                for entry in msg.get("peers", []):
+                    self._discover_peer(entry)
+            elif msg.get("type") == "PEER_JOINED":
+                self._discover_peer(msg)
+            # PEER_LEFT means "left the directory", not "direct link lost".
+            # Application messages from the directory are never dispatched.
 
-            mtype = msg.get("type")
-            if mtype == "PEER_LIST":
-                for pid in msg.get("peers", []):
-                    if pid != self.peer_id and pid not in self.connected_peers:
-                        self.connected_peers.add(pid)
-                        self._start_background_task(self._on_peer_join(pid))
-                        if self.on_peer_event:
-                            self.on_peer_event("PEER_JOINED", pid)
-                if self.on_peer_update:
-                    self.on_peer_update()
-
-            elif mtype == "PEER_JOINED":
-                pid = msg.get("peerId")
-                if pid and pid != self.peer_id:
-                    self.connected_peers.add(pid)
-                    self._start_background_task(self._on_peer_join(pid))
-                    if self.on_peer_event:
-                        self.on_peer_event("PEER_JOINED", pid)
-                    if self.on_peer_update:
-                        self.on_peer_update()
-
-            elif mtype == "PEER_LEFT":
-                pid = msg.get("peerId")
-                self.connected_peers.discard(pid)
-                for members in self.channel_members.values():
-                    members.discard(pid)
-                if self.on_peer_event:
-                    self.on_peer_event("PEER_LEFT", pid)
-                if self.on_peer_update:
-                    self.on_peer_update()
-
-            elif mtype == "ROUTED_MSG":
-                if str(msg.get("protocol", "")).startswith("/chat/"):
-                    self._start_background_task(self._handle_protocol_message(msg))
-                else:
-                    await self._handle_protocol_message(msg)
-
-    async def _on_peer_join(self, pid: str):
-        await asyncio.sleep(0.3)
-        # Announce DID & Initial Registration
+    async def _on_peer_join(self, pid: str, writer=None):
+        if writer is not None and self._peer_writers.get(pid) is not writer:
+            return
         tx = self._registration_tx
         if tx is None:
             tx = Transaction(type=TransactionType.REGISTER_KEY, senderPeerId=self.peer_id,
@@ -787,16 +1105,15 @@ class PeerNode:
             tx.sign(self.private_key)
             self._registration_tx = tx
         await self._send_routed("/did/1.0.0", pid, {
-            "peerId": self.peer_id,
-            "did": self.did,
-            "publicKey": self.public_key,
-            "regTx": tx.to_dict()
+            **self._listen_address(writer), "did": self.did,
+            "publicKey": self.public_key, "regTx": tx.to_dict(),
         })
-        await asyncio.sleep(0.2)
         await self._send_routed("/chain/sync/1.0.0", pid, {"type": "GET_CHAIN"})
-        for channel in self.joined_channels:
+        for ch in sorted(self.joined_channels):
             await self._send_routed("/channel/join/1.0.0", pid,
-                                    {"peerId": self.peer_id, "channel": channel, "action": "STATE"})
+                                    {"peerId": self.peer_id, "channel": ch, "action": "STATE"})
+        await self._send_routed("/p2p/pex/1.0.0", pid, {"action": "REQUEST"})
+
 
     async def _dispatch_protocol(self, msg: dict):
         proto = msg.get("protocol")
@@ -808,6 +1125,8 @@ class PeerNode:
 
         if proto == "/did/1.0.0":
             pid = data.get("peerId")
+            if pid != sender:
+                return
             pk = data.get("publicKey")
             reg_tx = data.get("regTx")
             if pid and pk and pid == sender and reg_tx:
@@ -816,6 +1135,35 @@ class PeerNode:
                     return
                 self.blockchain.add_transaction(tx)
                 self._refresh_peer_state(pid)
+
+            self._discover_peer(data)
+
+        elif proto == "/p2p/pex/1.0.0":
+            # Peer Exchange: share known peer addresses with newcomers
+            action = data.get("action")
+            if action == "REQUEST":
+                # Send our known peer address table
+                peers_info = {
+                    pid: {"host": addr[0], "port": addr[1]}
+                    for pid, addr in self._peer_addresses.items()
+                    if pid != sender and pid in self.connected_peers
+                }
+                # Also include ourselves
+                peers_info[self.peer_id] = {
+                    "host": getattr(self, "_advertise_host", "127.0.0.1"),
+                    "port": self.listen_port,
+                }
+                await self._send_routed("/p2p/pex/1.0.0", sender, {
+                    "action": "RESPONSE", "peers": peers_info
+                })
+            elif action == "RESPONSE":
+                peers_info = data.get("peers", {})
+                for pid, addr in peers_info.items():
+                    if isinstance(addr, dict):
+                        self._discover_peer({
+                            "peerId": pid, "listenHost": addr.get("host"),
+                            "listenPort": addr.get("port"),
+                        })
 
         elif proto == "/chat/dm/1.0.0":
             if data.get("to") != self.peer_id:
@@ -854,7 +1202,12 @@ class PeerNode:
                 decrypted = self.crypto_suite.decrypt_dm(enc_data, sender_key, self.private_key)
                 cur = self.trust_scores.get(from_peer, 50)
                 self.trust_scores[from_peer] = min(100, cur + 5)
-                self._record_message("INCOMING_DM", from_peer, self.peer_id, decrypted, "1-on-1 E2EE")
+                receipt_info = data.get("receipt")
+                computed_hash = self.crypto_suite.hash(sig_payload)
+                self._record_message(
+                    "INCOMING_DM", from_peer, self.peer_id, decrypted, "1-on-1 E2EE",
+                    receipt=receipt_info, message_hash=computed_hash
+                )
                 if self.on_message_received:
                     self.on_message_received(self.message_history[-1])
             except Exception as e:
@@ -900,7 +1253,10 @@ class PeerNode:
 
             try:
                 decrypted = self.crypto_suite.decrypt_channel(enc_data, channel_key)
-                self._record_message("INCOMING_CHANNEL", from_peer, channel, decrypted, f"Channel {channel}")
+                receipt_info = data.get("receipt")
+                computed_hash = self.crypto_suite.hash(sig_payload)
+                self._record_message("INCOMING_CHANNEL", from_peer, channel, decrypted, f"Channel {channel}",
+                                     receipt=receipt_info, message_hash=computed_hash)
                 if self.on_message_received:
                     self.on_message_received(self.message_history[-1])
             except Exception as e:
@@ -987,7 +1343,10 @@ class PeerNode:
             if not sender_key or not sig or not self.crypto_suite.verify(msg_text, sig, sender_key):
                 self._log_event(f"❌ Bad signature on broadcast from {from_peer[:16]}...")
                 return
-            self._record_message("INCOMING_BROADCAST", from_peer, "*", msg_text, "Signed Broadcast")
+            receipt_info = data.get("receipt")
+            computed_hash = self.crypto_suite.hash(f"{msg_text}:{sig}")
+            self._record_message("INCOMING_BROADCAST", from_peer, "*", msg_text, "Signed Broadcast",
+                                 receipt=receipt_info, message_hash=computed_hash)
             if self.on_message_received:
                 self.on_message_received(self.message_history[-1])
 
@@ -1009,14 +1368,17 @@ class PeerNode:
                 if self.on_peer_update:
                     self.on_peer_update()
 
-    def _record_message(self, kind: str, sender: str, target: str, text: str, mode: str):
+    def _record_message(self, kind: str, sender: str, target: str, text: str, mode: str,
+                        receipt: Optional[Dict[str, Any]] = None, message_hash: Optional[str] = None):
         record = {
             "kind": kind,
             "sender": sender,
             "target": target,
             "text": text,
             "mode": mode,
-            "timestamp": datetime.now().strftime("%H:%M:%S")
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "receipt": receipt,
+            "messageHash": message_hash
         }
         self.message_history.append(record)
         if len(self.message_history) > 100:
